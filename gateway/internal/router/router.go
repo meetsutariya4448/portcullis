@@ -4,11 +4,13 @@ package router
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/meetsutariya4448/portcullis/gateway/internal/config"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/translate"
 )
 
 // maxIdleConnsPerUpstream bounds the pooled idle connections kept open to
@@ -18,12 +20,17 @@ const maxIdleConnsPerUpstream = 32
 // Upstream pairs a configured upstream with its own connection-pooled HTTP
 // client and timeout, per SPEC-NOTES.md §1: "One upstream connection pool
 // per configured upstream, with a per-upstream timeout."
+//
+// LegacyPool is non-nil only when ProtocolVersion is translate.LegacyProtocolVersion
+// (2025-11-25): requests to that upstream go through the session-pool shim
+// in package translate instead of Client directly.
 type Upstream struct {
 	Name            string
 	Namespace       string
 	URL             string
 	ProtocolVersion string
 	Client          *http.Client
+	LegacyPool      *translate.Pool
 }
 
 // Router maps a tool/resource/prompt namespace to its upstream.
@@ -32,27 +39,34 @@ type Router struct {
 }
 
 // New builds a Router from the loaded config, constructing one pooled
-// *http.Client per upstream.
-func New(cfg *config.Config) (*Router, error) {
+// *http.Client per upstream, and — for upstreams declaring
+// protocol_version: "2025-11-25" — a translate.Pool that performs the
+// legacy handshake and holds sessions on the client's behalf.
+func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 	upstreams := make(map[string]*Upstream, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
 		timeout, err := u.TimeoutDuration()
 		if err != nil {
 			return nil, err
 		}
-		upstreams[u.Namespace] = &Upstream{
+		client := &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: maxIdleConnsPerUpstream,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		}
+		upstream := &Upstream{
 			Name:            u.Name,
 			Namespace:       u.Namespace,
 			URL:             u.URL,
 			ProtocolVersion: u.ProtocolVersion,
-			Client: &http.Client{
-				Timeout: timeout,
-				Transport: &http.Transport{
-					MaxIdleConnsPerHost: maxIdleConnsPerUpstream,
-					IdleConnTimeout:     90 * time.Second,
-				},
-			},
+			Client:          client,
 		}
+		if u.ProtocolVersion == translate.LegacyProtocolVersion {
+			upstream.LegacyPool = translate.NewPool(u.URL, client, log)
+		}
+		upstreams[u.Namespace] = upstream
 	}
 	return &Router{upstreams: upstreams}, nil
 }

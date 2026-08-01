@@ -25,7 +25,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	rtr, err := router.New(cfg)
+	rtr, err := router.New(cfg, log)
 	if err != nil {
 		log.Error("failed to build router", "error", err)
 		os.Exit(1)

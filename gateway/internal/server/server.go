@@ -5,6 +5,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	gwmcp "github.com/meetsutariya4448/portcullis/gateway/internal/mcp"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/translate"
 )
 
 // maxBodyBytes bounds how much of a request body Portcullis will read into
@@ -100,18 +102,22 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 
 	preUpstream := time.Since(handlerStart)
 
-	outReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.URL, bytes.NewReader(body))
-	if err != nil {
-		s.writeGatewayError(w, r, req.Method, headers.Name, http.StatusBadGateway, req.ID, "failed to build upstream request", handlerStart, err)
-		return
-	}
-	copyHeaders(outReq.Header, r.Header)
-
 	upstreamStart := time.Now()
-	resp, err := upstream.Client.Do(outReq)
+	var resp *http.Response
+	if upstream.LegacyPool != nil {
+		resp, err = upstream.LegacyPool.Forward(r.Context(), body)
+	} else {
+		var outReq *http.Request
+		outReq, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.URL, bytes.NewReader(body))
+		if err == nil {
+			copyHeaders(outReq.Header, r.Header)
+			resp, err = upstream.Client.Do(outReq)
+		}
+	}
 	upstreamDuration := time.Since(upstreamStart)
 	if err != nil {
-		s.writeGatewayError(w, r, req.Method, headers.Name, http.StatusBadGateway, req.ID, "upstream request failed", handlerStart, err)
+		httpStatus, message := translateForwardError(err)
+		s.writeGatewayError(w, r, req.Method, headers.Name, httpStatus, req.ID, message, handlerStart, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -195,6 +201,22 @@ func (s *Server) writeGatewayError(w http.ResponseWriter, r *http.Request, metho
 		logArgs = append(logArgs, "error", cause)
 	}
 	s.log.Error("mcp request failed", logArgs...)
+}
+
+// translateForwardError maps an error from a legacy upstream forward
+// (package translate) or a direct upstream call to the HTTP status and
+// message Portcullis should return to the client.
+func translateForwardError(err error) (httpStatus int, message string) {
+	switch {
+	case errors.Is(err, translate.ErrUnsupportedMRTR):
+		return http.StatusNotImplemented, "legacy upstream requires a multi-round-trip flow (sampling/elicitation/roots) that this gateway does not bridge"
+	case errors.Is(err, translate.ErrCircuitOpen):
+		return http.StatusServiceUnavailable, "upstream circuit breaker is open"
+	case errors.Is(err, translate.ErrPoolExhausted):
+		return http.StatusServiceUnavailable, "legacy session pool exhausted"
+	default:
+		return http.StatusBadGateway, "upstream request failed"
+	}
 }
 
 // copyHeaders copies all headers from src to dst except hop-by-hop headers.
