@@ -1,0 +1,6 @@
+upstreams:
+  - name: weather-server
+    namespace: weather
+    url: http://localhost:9001/mcp
+    protocol_version: "2026-07-28"
+    timeout: 30s
