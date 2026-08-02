@@ -194,10 +194,16 @@ run_hey() {
   out="$("${cmd[@]}" 2>&1)"
   echo "$out" >"$RAW_DIR/${label}.hey.log"
 
+  # This build of hey (0.1.5, Homebrew) prints latency-distribution labels as
+  # "50%% in ..." (doubled percent sign) instead of "50% in ...". Normalize
+  # for parsing only -- the raw log above keeps hey's actual output verbatim.
+  local out_normalized
+  out_normalized="$(echo "$out" | sed 's/%%/%/g')"
+
   local p50 p95 p99 rps
-  p50="$(echo "$out" | awk '/^ *50% in/ {print $3}')"
-  p95="$(echo "$out" | awk '/^ *95% in/ {print $3}')"
-  p99="$(echo "$out" | awk '/^ *99% in/ {print $3}')"
+  p50="$(echo "$out_normalized" | awk '/^ *50% in/ {print $3}')"
+  p95="$(echo "$out_normalized" | awk '/^ *95% in/ {print $3}')"
+  p99="$(echo "$out_normalized" | awk '/^ *99% in/ {print $3}')"
   rps="$(echo "$out" | awk -F'[[:space:]]+' '/Requests\/sec:/ {print $3}')"
 
   if [[ -z "$p50" || -z "$p95" || -z "$p99" || -z "$rps" ]]; then
@@ -307,7 +313,11 @@ ms() {
     rest="${entry#*|}"
     upstream="${rest%%|*}"
     scenario="${rest#*|}"
-    non200="$(fact "$label" status | grep -vE '^\[200\]' | tr '\n' ' ' | sed 's/ *$//')"
+    # `grep -v` exits 1 when every response was 200 -- the clean, desired
+    # outcome, not a failure. Under `set -o pipefail` that would otherwise
+    # kill the whole script right when a run went perfectly; `|| true`
+    # absorbs it (the empty-output case is handled right below).
+    non200="$(fact "$label" status | grep -vE '^\[200\]' | tr '\n' ' ' | sed 's/ *$//' || true)"
     [[ -z "$non200" ]] && non200="none"
     printf '| %s | %s | %s | %s | %s | %s | %s |\n' \
       "$scenario" "$upstream" \

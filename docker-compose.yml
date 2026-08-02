@@ -6,14 +6,18 @@ services:
       POSTGRES_PASSWORD: portcullis
       POSTGRES_DB: portcullis
     ports:
-      - "5432:5432"
+      # Remapped from the default 5432 -- a host postgres is often already
+      # bound there. Containers on the compose network still reach this one
+      # at postgres:5432; only the host-side port differs.
+      - "15432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
   redis:
     image: redis:7
     ports:
-      - "6379:6379"
+      # Remapped from the default 6379 for the same reason as postgres above.
+      - "16379:6379"
 
   # --- bench profile: gateway overhead benchmark harness --------------------
   # Not started by a plain `docker compose up`. Run with
