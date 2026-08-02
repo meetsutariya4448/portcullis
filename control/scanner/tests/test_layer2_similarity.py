@@ -1,8 +1,8 @@
 """Layer 2 tests run entirely offline: InMemoryVectorStore (pure Python, no
-Postgres) plus a small deterministic bag-of-words FakeEmbedder (no network
-call to Voyage). The fake embedder still produces meaningful cosine
-similarity — texts sharing more words score higher — so threshold/verdict
-logic gets exercised realistically, just without live infra.
+Postgres) plus a small deterministic bag-of-words FakeEmbedder (no
+sentence-transformers model load). The fake embedder still produces
+meaningful cosine similarity — texts sharing more words score higher — so
+threshold/verdict logic gets exercised realistically, just without live infra.
 """
 
 from __future__ import annotations

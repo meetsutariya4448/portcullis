@@ -9,11 +9,11 @@ default below is a placeholder.
 
 Both the embedding provider and the vector store sit behind small
 interfaces (Embedder / VectorStore) so this module's own tests run without
-a live Postgres instance or a network call to an embeddings API:
-production wires VoyageEmbedder + PgVectorStore; tests use a fake embedder
-and an in-memory store. Claude has no first-party embeddings endpoint, so
-production defaults to Voyage AI (Anthropic's recommended embeddings
-partner).
+a live Postgres instance or a network call: production wires
+SentenceTransformerEmbedder + PgVectorStore; tests use a fake embedder and
+an in-memory store. Embeddings run locally via sentence-transformers
+(all-MiniLM-L6-v2) rather than a hosted embeddings API — no API key
+required, no per-call network dependency once the model weights are cached.
 """
 
 from __future__ import annotations
@@ -23,9 +23,9 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 DEFAULT_TABLE = "attack_embeddings"
-# Voyage's voyage-3 embedding dimensionality; PgVectorStore needs the exact
+# all-MiniLM-L6-v2's embedding dimensionality; PgVectorStore needs the exact
 # dimension to declare the pgvector column.
-DEFAULT_EMBEDDING_DIM = 1024
+DEFAULT_EMBEDDING_DIM = 384
 
 
 class Embedder(Protocol):
@@ -210,22 +210,23 @@ def connect(dsn: str, dim: int = DEFAULT_EMBEDDING_DIM, table: str = DEFAULT_TAB
     return store
 
 
-# --- production Embedder: Voyage AI ------------------------------------------
+# --- production Embedder: local sentence-transformers ------------------------
 
 
-class VoyageEmbedder:
-    """Production Embedder backed by Voyage AI — Anthropic's recommended
-    embeddings partner (Claude itself has no first-party embeddings
-    endpoint). Imports voyageai lazily so this module stays importable
-    without it installed.
+class SentenceTransformerEmbedder:
+    """Production Embedder backed by a locally-run sentence-transformers
+    model (default: all-MiniLM-L6-v2, 384 dimensions). Runs on-machine, no
+    API key, no per-call network dependency once weights are cached (~90MB,
+    downloaded from the Hugging Face Hub on first use). Imports
+    sentence_transformers lazily so this module stays importable without it
+    installed.
     """
 
-    def __init__(self, api_key: str | None = None, model: str = "voyage-3"):
-        import voyageai
+    def __init__(self, model: str = "all-MiniLM-L6-v2"):
+        from sentence_transformers import SentenceTransformer
 
-        self.client = voyageai.Client(api_key=api_key)
-        self.model = model
+        self._model = SentenceTransformer(model)
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        result = self.client.embed(list(texts), model=self.model, input_type="document")
-        return result.embeddings
+        embeddings = self._model.encode(list(texts), normalize_embeddings=False)
+        return embeddings.tolist()

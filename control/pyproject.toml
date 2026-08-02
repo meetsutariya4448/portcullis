@@ -9,6 +9,7 @@ dependencies = [
     "pydantic",
     "psycopg[binary]",
     "pgvector",
+    "sentence-transformers",
 ]
 
 [project.optional-dependencies]
