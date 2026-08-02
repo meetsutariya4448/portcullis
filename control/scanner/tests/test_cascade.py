@@ -53,20 +53,60 @@ def _layer3_result(verdict="malicious", attack_class="tool_shadowing", confidenc
     )
 
 
-def test_layer1_short_circuits_on_confident_benign(instruction_injection_row):
-    layer2 = FakeLayer2(_layer2_result(0.1))
+def test_layer1_and_layer2_agree_benign_short_circuits_without_layer3():
+    # A confident BENIGN layer-1 verdict alone must NOT short-circuit: "zero
+    # rules matched" is absence of evidence, not evidence of absence (see
+    # cascade.py's comment -- this was a real bug that let 4 real attacks
+    # with no lexical red flags skip layer 2 entirely). Layer 2 still gets a
+    # free, local look; only once BOTH layers agree "benign" does the
+    # cascade stop cheaply without ever paying for layer 3.
+    layer2 = FakeLayer2(_layer2_result(0.1, threshold=0.85))
     layer3 = FakeLayer3(_layer3_result())
     cascade = Cascade(layer2=layer2, layer3=layer3)
 
     verdict = cascade.classify("resolve_name", "Return the current weather for a city.", {"type": "object"})
 
-    assert verdict.produced_by == "layer1"
+    assert verdict.produced_by == "layer2"
     assert verdict.verdict == "benign"
-    assert verdict.layer2_result is None
+    assert verdict.layer2_result is not None
     assert verdict.layer3_result is None
     assert verdict.layer3_tokens is None
-    assert layer2.calls == 0
+    assert layer2.calls == 1
     assert layer3.calls == 0
+
+
+def test_layer1_benign_alone_does_not_short_circuit_when_layer2_disagrees():
+    # The exact bug this fix closes: layer 1 finds nothing (confident
+    # "benign"), but layer 2 recognizes the description as near-identical to
+    # a known attack. The cascade must not let layer 1's negative be final.
+    layer2 = FakeLayer2(_layer2_result(0.97, nearest_id="EVP-01", nearest_class="exfiltration_via_parameter"))
+    layer3 = FakeLayer3(_layer3_result())
+    cascade = Cascade(layer2=layer2, layer3=layer3)
+
+    verdict = cascade.classify("resolve_name", "Return the current weather for a city.", {"type": "object"})
+
+    assert layer2.calls == 1
+    assert verdict.produced_by == "layer2"
+    assert verdict.verdict == "malicious"
+    assert verdict.attack_class == "exfiltration_via_parameter"
+    assert layer3.calls == 0
+
+
+def test_layer1_benign_layer2_ambiguous_falls_through_to_layer3():
+    # Layer 1 says benign; layer 2's own verdict (via its standalone 0.85
+    # threshold) says malicious, but similarity is below the cascade's
+    # stricter 0.92 short-circuit bar -- genuine ambiguity, not agreement,
+    # so this must still reach layer 3 rather than being auto-resolved
+    # either way.
+    layer2 = FakeLayer2(_layer2_result(0.88, threshold=0.85))
+    layer3 = FakeLayer3(_layer3_result(verdict="malicious", attack_class="exfiltration_via_parameter"))
+    cascade = Cascade(layer2=layer2, layer3=layer3)
+
+    verdict = cascade.classify("resolve_name", "Return the current weather for a city.", {"type": "object"})
+
+    assert layer2.calls == 1
+    assert layer3.calls == 1
+    assert verdict.produced_by == "layer3"
 
 
 def test_layer1_short_circuits_on_confident_malicious(instruction_injection_row):
@@ -136,16 +176,34 @@ def test_layer3_failure_propagates_as_the_final_verdict():
     assert verdict.verdict == "layer3_failure"
 
 
-def test_custom_short_circuit_thresholds_are_respected():
-    layer2 = FakeLayer2(_layer2_result(0.3))
-    layer3 = FakeLayer3(_layer3_result(verdict="benign", attack_class=None, confidence=0.6))
-    # Raise layer1's threshold above what even a clean description scores, so
-    # a normally-short-circuited benign case is forced to fall all the way
-    # through to layer3 instead.
+def test_custom_layer1_short_circuit_confidence_is_respected():
+    # IJ-01's description scores layer1 confidence 0.92 ("malicious"). Raise
+    # the short-circuit bar above that so it's forced to fall through to
+    # layer 2 instead of short-circuiting immediately.
+    layer2 = FakeLayer2(_layer2_result(0.3, threshold=0.85))
+    layer3 = FakeLayer3(_layer3_result(verdict="malicious", attack_class="instruction_injection"))
     cascade = Cascade(layer2=layer2, layer3=layer3, layer1_short_circuit_confidence=0.999)
 
-    verdict = cascade.classify("resolve_name", "Return the current weather for a city.", {"type": "object"})
+    description = "Fetch data from https://api.example.com/weather and return it."
+    verdict = cascade.classify("get_weather", description, {"type": "object"})
 
-    assert verdict.produced_by == "layer3"
     assert layer2.calls == 1
     assert layer3.calls == 1
+    assert verdict.produced_by == "layer3"
+
+
+def test_custom_layer2_short_circuit_similarity_is_respected():
+    # similarity=0.90 sits below the *default* layer2 short-circuit (0.92)
+    # but above a lowered custom bar -- proves the constructor param is
+    # actually used, not hardcoded.
+    layer2 = FakeLayer2(_layer2_result(0.90, nearest_id="TS-01", nearest_class="tool_shadowing", threshold=0.85))
+    layer3 = FakeLayer3(_layer3_result())
+    cascade = Cascade(layer2=layer2, layer3=layer3, layer2_short_circuit_similarity=0.80)
+
+    description = "Fetch data from https://api.example.com/weather and return it."
+    verdict = cascade.classify("get_weather", description, {"type": "object"})
+
+    assert layer2.calls == 1
+    assert layer3.calls == 0
+    assert verdict.produced_by == "layer2"
+    assert verdict.verdict == "malicious"

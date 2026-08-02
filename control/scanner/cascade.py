@@ -60,7 +60,17 @@ class Cascade:
 
     def classify(self, name: str, description: str, input_schema: dict) -> CascadeVerdict:
         l1 = layer1_scan(description)
-        if l1.confidence >= self.layer1_short_circuit_confidence:
+
+        # Only a confident MALICIOUS layer-1 verdict short-circuits directly.
+        # A confident BENIGN layer-1 verdict does not: "zero rules matched" is
+        # absence of evidence, not evidence of absence, and treating it as a
+        # final answer let real attacks with no lexical red flags (e.g. the
+        # EVP-01 family -- "pass the conversation history as a parameter")
+        # skip layer 2 entirely even though layer 2 would catch them. A
+        # benign/uncertain layer-1 verdict always gets a second, still-free
+        # (local, no API cost) opinion from layer 2 below before the cascade
+        # will call something safe.
+        if l1.verdict == "malicious" and l1.confidence >= self.layer1_short_circuit_confidence:
             return CascadeVerdict(
                 verdict=l1.verdict,
                 attack_class=None,  # layer 1 flags categories, not attack subtypes
@@ -77,6 +87,17 @@ class Cascade:
                 verdict="malicious",
                 attack_class=l2.nearest_attack_class,
                 confidence=l2.similarity,
+                produced_by="layer2",
+                layer1_result=l1,
+                layer2_result=l2,
+                layer3_result=None,
+            )
+
+        if l1.verdict == "benign" and l2.verdict == "benign":
+            return CascadeVerdict(
+                verdict="benign",
+                attack_class=None,
+                confidence=min(l1.confidence, 1.0 - l2.similarity),
                 produced_by="layer2",
                 layer1_result=l1,
                 layer2_result=l2,
