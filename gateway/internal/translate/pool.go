@@ -48,14 +48,18 @@ type Pool struct {
 }
 
 // NewPool builds a session pool for a single legacy upstream. client should
-// already be configured with the upstream's timeout.
-func NewPool(url string, client *http.Client, log *slog.Logger) *Pool {
+// already be configured with the upstream's timeout. maxSize <= 0 means
+// "use DefaultMaxPoolSize."
+func NewPool(url string, client *http.Client, log *slog.Logger, maxSize int) *Pool {
+	if maxSize <= 0 {
+		maxSize = DefaultMaxPoolSize
+	}
 	return &Pool{
 		url:     url,
 		client:  client,
 		log:     log,
 		breaker: NewCircuitBreaker(),
-		maxSize: DefaultMaxPoolSize,
+		maxSize: maxSize,
 	}
 }
 

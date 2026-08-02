@@ -1,0 +1,15 @@
+upstreams:
+  - name: bench-native
+    namespace: native
+    url: http://upstream-native:9101/mcp
+    protocol_version: "2026-07-28"
+    timeout: 5s
+  - name: bench-legacy
+    namespace: legacy
+    url: http://upstream-legacy:9102/mcp
+    protocol_version: "2025-11-25"
+    timeout: 5s
+    # DefaultMaxPoolSize (8) is sized for production, not for `hey -c 50`
+    # hammering a single upstream. Sized comfortably above the benchmark's
+    # concurrency so pool exhaustion never shows up as failed requests.
+    max_pool_size: 64

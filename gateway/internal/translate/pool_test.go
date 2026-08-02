@@ -130,7 +130,7 @@ func TestPool_ForwardSucceedsWithoutCallerHandlingSession(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger())
+	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
 
 	resp, err := pool.Forward(context.Background(), requestBody())
 	if err != nil {
@@ -159,7 +159,7 @@ func TestPool_ReusesSessionAcrossRequests(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger())
+	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
 
 	for i := 0; i < 5; i++ {
 		resp, err := pool.Forward(context.Background(), requestBody())
@@ -182,7 +182,7 @@ func TestPool_RecyclesDeadSession(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger())
+	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
 
 	resp, err := pool.Forward(context.Background(), requestBody())
 	if err != nil {
@@ -213,7 +213,7 @@ func TestPool_ForwardReturnsErrUnsupportedMRTR(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger())
+	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
 
 	_, err := pool.Forward(context.Background(), requestBody())
 	if !errors.Is(err, ErrUnsupportedMRTR) {
@@ -239,7 +239,7 @@ func TestPool_ExhaustionFailsFast(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger())
+	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
 	pool.maxSize = 1
 
 	sess, err := pool.lease(context.Background())
@@ -263,7 +263,7 @@ func TestPool_CircuitBreakerOpensAfterRepeatedHandshakeFailures(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger())
+	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
 
 	var lastErr error
 	for i := 0; i < defaultBreakerMinSamples; i++ {
@@ -287,7 +287,7 @@ func TestPool_PoolExhaustionDoesNotTripBreaker(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger())
+	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
 	pool.maxSize = 1
 
 	sess, err := pool.lease(context.Background())

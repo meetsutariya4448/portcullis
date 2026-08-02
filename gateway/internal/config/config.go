@@ -23,6 +23,12 @@ type Upstream struct {
 	// defaultUpstreamTimeout if empty. Accepts any value time.ParseDuration
 	// understands, e.g. "30s".
 	Timeout string `yaml:"timeout"`
+	// MaxPoolSize overrides translate.DefaultMaxPoolSize for this upstream's
+	// legacy session pool (only meaningful when ProtocolVersion is
+	// translate.LegacyProtocolVersion). Zero means "use the default." This
+	// exists because the default (8) is sized for production, not for a
+	// benchmark run at 50+ concurrent requests against a single upstream.
+	MaxPoolSize int `yaml:"max_pool_size"`
 }
 
 // TimeoutDuration returns the parsed per-upstream timeout, falling back to
@@ -78,6 +84,9 @@ func (c *Config) validate() error {
 		seen[u.Namespace] = true
 		if _, err := u.TimeoutDuration(); err != nil {
 			return err
+		}
+		if u.MaxPoolSize < 0 {
+			return fmt.Errorf("upstream %q: max_pool_size must be >= 0, got %d", u.Name, u.MaxPoolSize)
 		}
 	}
 	return nil
