@@ -3,7 +3,7 @@ name = "portcullis-control"
 version = "0.1.0"
 description = "Portcullis control plane: tool-poisoning scanner and evals"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["certifi"]
 
 [build-system]
 requires = ["hatchling"]
