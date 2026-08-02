@@ -1,10 +1,10 @@
 # Portcullis Scanner -- Evaluation Report
 
-Generated: 2026-08-02T18:17:15.060898+00:00
+Generated: 2026-08-02T21:52:41.560895+00:00
 Corpus: `control/evals/corpus/corpus.jsonl` -- 139 rows (101 benign, 38 malicious)
 Layer 3 model: `claude-opus-5`
 Layer 2 embedder: `all-MiniLM-L6-v2` (local, sentence-transformers, 384-dim)
-Eval wall-clock duration: 479.9s
+Eval wall-clock duration: 484.5s
 
 ## Methodology and limitations
 
@@ -30,15 +30,29 @@ Malicious rows by attack class: {'cross_server_reference': 9, 'exfiltration_via_
 **This is not a held-out test set.** Two specific ways that shows up here:
 
 1. *Layer 2* indexes the malicious corpus itself as its "known attack"
-   lookup table. To keep a malicious row from trivially matching itself at
-   similarity 1.0, this script uses **leave-one-out**: when scoring
-   malicious row X, X's own embedding is excluded from the index (built
-   from the other 37 malicious rows), while the query
-   embedding for X is still freshly computed. Benign rows are scored
-   against the full index (nothing to leave out). This is a fairer test
-   than "index everything, query everything" but it is still evaluation
-   against siblings drawn from the same 11-seed pool -- not
-   against a genuinely novel attack corpus.
+   lookup table. This script reports layer 2 under BOTH of two indexing
+   schemes -- see the side-by-side table and explanation in the Results
+   section below, this is only the short version:
+   - **Leave-one-out**: excludes only the scored sample's own embedding.
+     Its parent seed and sibling mechanical variants remain in the index,
+     so this measures near-duplicate retrieval more than generalization.
+   - **Leave-one-seed-family-out**: excludes the scored sample's entire
+     seed family (parent seed + all 27 of its mechanical
+     variants) from the index, so it can only match a DIFFERENT seed
+     family or attack class. This is the closer proxy for generalization
+     to a genuinely unseen attack, and it scores lower than leave-one-out
+     -- the gap between the two is reported as a finding, not resolved
+     away by picking one number.
+   Benign rows are scored against the full index either way (nothing of
+   theirs to leave out). Even leave-one-seed-family-out is still
+   evaluation against the same 11-seed pool this corpus was
+   built from -- not against a genuinely independent attack corpus.
+   The **full cascade** is also reported under both layer-2 schemes (see
+   the cascade comparison table in Results) -- its leave-one-out recall
+   inherits the same sibling-retrieval optimism, and its
+   leave-one-seed-family-out recall shows detection shifting almost
+   entirely onto layer 1 and layer 3 once layer 2 can no longer lean on a
+   near-identical sibling.
 2. *Layer 3* is a general-purpose LLM classifier; nothing here confirms
    whether `claude-opus-5` was trained on the (public) disclosures the seeds
    are drawn from. A strong layer-3 score is consistent with either "the
@@ -96,9 +110,69 @@ precision=1.000  recall=0.737  F1=0.848  (n=139)
 | instruction_injection | 0.667 (4/6) | 6  **WARNING: n<10, not statistically meaningful** |
 | tool_shadowing | 0.923 (12/13) | 13 |
 
-Layer 1 latency: p50=0.17ms  p95=0.70ms  (n=139)
+Layer 1 latency: p50=0.16ms  p95=0.65ms  (n=139)
 
-### Layer 2 -- embedding similarity (threshold=0.85) (n=139)
+### Layer 2 -- embedding similarity, indexing scheme comparison (threshold=0.85, n=139)
+
+| Indexing scheme | TP | FP | FN | TN | precision | recall | F1 |
+|---|---|---|---|---|---|---|---|
+| Leave-one-out (original) | 36 | 0 | 2 | 101 | 1.000 | 0.947 | 0.973 |
+| Leave-one-seed-family-out | 0 | 0 | 38 | 101 | nan | 0.000 | nan |
+
+**Why they differ:** 27 of the 38 malicious samples are mechanical variants of 11 seeds (rename tool / move payload / swap target -- see corpus/README.md). Leave-one-out only removes the scored sample's OWN embedding from the index; its parent seed and sibling variants (e.g. a seed with 6 variants keeps all 6 in the index when scoring any one of them) remain, so a hit is often "found the near-identical sibling still in the index" rather than a generalized detection. Leave-one-seed-family-out removes the scored sample's ENTIRE family (parent seed + every other variant of it) before scoring it, so its recall reflects generalization from OTHER seed families and attack classes only. **The leave-one-out number is not deleted or superseded -- it answers a different, still-useful question ("can layer 2 retrieve a near-duplicate of something already in the attack index"), while leave-one-seed-family-out is the closer proxy for generalization to a genuinely unseen attack. The gap between the two rows above is itself the finding: it quantifies how much of layer 2's apparent recall was sibling retrieval versus recognition of an unfamiliar attack.**
+
+Recall by attack class -- leave-one-out (excludes only the scored sample):
+| attack_class | recall | n |
+|---|---|---|
+| cross_server_reference | 1.000 (9/9) | 9  **WARNING: n<10, not statistically meaningful** |
+| exfiltration_via_parameter | 0.900 (9/10) | 10 |
+| instruction_injection | 1.000 (6/6) | 6  **WARNING: n<10, not statistically meaningful** |
+| tool_shadowing | 0.923 (12/13) | 13 |
+
+Recall by attack class -- leave-one-seed-family-out (excludes the scored sample's whole seed family):
+| attack_class | recall | n |
+|---|---|---|
+| cross_server_reference | 0.000 (0/9) | 9  **WARNING: n<10, not statistically meaningful** |
+| exfiltration_via_parameter | 0.000 (0/10) | 10 |
+| instruction_injection | 0.000 (0/6) | 6  **WARNING: n<10, not statistically meaningful** |
+| tool_shadowing | 0.000 (0/13) | 13 |
+
+Layer 2 latency: p50=12.67ms  p95=17.94ms  (n=139)
+Layer 2 cost: $0.00 (local model, no API calls)
+
+### Layer 3 -- LLM classifier (claude-opus-5, standalone: every row classified) (n=139)
+
+| | Actual malicious | Actual benign |
+|---|---|---|
+| Predicted malicious | TP=25 | FP=2 |
+| Predicted not-malicious | FN=13 | TN=99 |
+
+precision=0.926  recall=0.658  F1=0.769  (n=139)
+
+evidence-span rejection rate: 0.007 (1/139)
+other layer3 failures (e.g. API errors, no parsed output): 10/139
+
+| attack_class | recall | n |
+|---|---|---|
+| cross_server_reference | 0.556 (5/9) | 9  **WARNING: n<10, not statistically meaningful** |
+| exfiltration_via_parameter | 0.400 (4/10) | 10 |
+| instruction_injection | 0.667 (4/6) | 6  **WARNING: n<10, not statistically meaningful** |
+| tool_shadowing | 0.923 (12/13) | 13 |
+
+Layer 3 latency: p50=3030.66ms  p95=5782.99ms  (n=139)
+Layer 3 tokens: 205455 input + 8989 output across 139 calls (standalone -- every row, not just cascade fallthrough)
+Layer 3 estimated cost per 1,000 tools scanned (standalone): $9.01
+
+### Full cascade -- layer2 indexing scheme comparison (n=139)
+
+| Layer2 indexing scheme | TP | FP | FN | TN | precision | recall | F1 | produced_by (l1/l2/l3) | LLM invocation rate |
+|---|---|---|---|---|---|---|---|---|---|
+| Leave-one-out | 36 | 0 | 2 | 101 | 1.000 | 0.947 | 0.973 | 20/115/4 | 0.029 (4/139) |
+| Leave-one-seed-family-out | 32 | 0 | 6 | 101 | 1.000 | 0.842 | 0.914 | 20/103/16 | 0.115 (16/139) |
+
+**Why they differ:** the cascade's layer-2 branch is the exact same leaky-vs-generalizing tradeoff reported for layer 2 standalone above -- with leave-one-out, a malicious row's siblings are still in the index, so layer 2's 0.92 cascade short-circuit fires easily and layer 2 carries most of the cascade's recall. With leave-one-seed-family-out, layer 2's similarity to a genuinely-excluded family rarely clears even its own 0.85 standalone threshold (see the layer 2 section above -- family-out recall there is 0.000), so it essentially never clears the cascade's stricter 0.92 bar either. Under family-out, detection is carried almost entirely by layer 1 (confident rule-based catches) and layer 3 (whatever falls through) instead -- the `produced_by` column above shows exactly how the load shifts. **Neither row is deleted or superseded: leave-one-out is what the cascade does when its attack index already contains something near-identical to the incoming attack (the realistic in-production case, since a real deployment's index only grows); leave-one-seed-family-out is what the cascade does against a genuinely unfamiliar attack construction, which is the harder and more honest question if you're asking "how well does this generalize."**
+
+### Full cascade -- leave-one-out layer2 (n=139)
 
 | | Actual malicious | Actual benign |
 |---|---|---|
@@ -107,6 +181,10 @@ Layer 1 latency: p50=0.17ms  p95=0.70ms  (n=139)
 
 precision=1.000  recall=0.947  F1=0.973  (n=139)
 
+produced_by breakdown: layer1=20, layer2=115, layer3=4 (n=139)
+LLM invocation rate (fraction reaching layer 3): 0.029 (4/139)
+evidence-span rejection rate (of rows reaching layer 3): 0.000 (0/4)
+
 | attack_class | recall | n |
 |---|---|---|
 | cross_server_reference | 1.000 (9/9) | 9  **WARNING: n<10, not statistically meaningful** |
@@ -114,33 +192,11 @@ precision=1.000  recall=0.947  F1=0.973  (n=139)
 | instruction_injection | 1.000 (6/6) | 6  **WARNING: n<10, not statistically meaningful** |
 | tool_shadowing | 0.923 (12/13) | 13 |
 
-Layer 2 latency: p50=12.40ms  p95=18.07ms  (n=139)
-Layer 2 cost: $0.00 (local model, no API calls)
+Cascade (leave-one-out) end-to-end latency: p50=12.67ms  p95=22.77ms  (n=139)
+Cascade (leave-one-out) tokens actually spent: 10433 input + 675 output across 4 LLM calls (out of 139 rows)
+Cascade (leave-one-out) estimated cost per 1,000 tools scanned: $0.50
 
-### Layer 3 -- LLM classifier (claude-opus-5, standalone: every row classified) (n=139)
-
-| | Actual malicious | Actual benign |
-|---|---|---|
-| Predicted malicious | TP=24 | FP=1 |
-| Predicted not-malicious | FN=14 | TN=100 |
-
-precision=0.960  recall=0.632  F1=0.762  (n=139)
-
-evidence-span rejection rate: 0.007 (1/139)
-other layer3 failures (e.g. API errors, no parsed output): 11/139
-
-| attack_class | recall | n |
-|---|---|---|
-| cross_server_reference | 0.556 (5/9) | 9  **WARNING: n<10, not statistically meaningful** |
-| exfiltration_via_parameter | 0.400 (4/10) | 10 |
-| instruction_injection | 0.500 (3/6) | 6  **WARNING: n<10, not statistically meaningful** |
-| tool_shadowing | 0.923 (12/13) | 13 |
-
-Layer 3 latency: p50=3078.19ms  p95=4912.25ms  (n=139)
-Layer 3 tokens: 205455 input + 8982 output across 139 calls (standalone -- every row, not just cascade fallthrough)
-Layer 3 estimated cost per 1,000 tools scanned (standalone): $9.01
-
-### Full cascade (n=139)
+### Full cascade -- leave-one-seed-family-out layer2 (n=139)
 
 | | Actual malicious | Actual benign |
 |---|---|---|
@@ -149,9 +205,9 @@ Layer 3 estimated cost per 1,000 tools scanned (standalone): $9.01
 
 precision=1.000  recall=0.842  F1=0.914  (n=139)
 
-produced_by breakdown: layer1=123, layer2=12, layer3=4 (n=139)
-LLM invocation rate (fraction reaching layer 3): 0.029 (4/139)
-evidence-span rejection rate (of rows reaching layer 3): 0.000 (0/4)
+produced_by breakdown: layer1=20, layer2=103, layer3=16 (n=139)
+LLM invocation rate (fraction reaching layer 3): 0.115 (16/139)
+evidence-span rejection rate (of rows reaching layer 3): 0.000 (0/16)
 
 | attack_class | recall | n |
 |---|---|---|
@@ -160,7 +216,7 @@ evidence-span rejection rate (of rows reaching layer 3): 0.000 (0/4)
 | instruction_injection | 1.000 (6/6) | 6  **WARNING: n<10, not statistically meaningful** |
 | tool_shadowing | 0.923 (12/13) | 13 |
 
-Cascade end-to-end latency: p50=0.24ms  p95=7.38ms  (n=139)
-Cascade tokens actually spent: 10433 input + 639 output across 4 LLM calls (out of 139 rows)
-Cascade estimated cost per 1,000 tools scanned: $0.49
+Cascade (leave-one-seed-family-out) end-to-end latency: p50=6.71ms  p95=3747.69ms  (n=139)
+Cascade (leave-one-seed-family-out) tokens actually spent: 25137 input + 1977 output across 16 LLM calls (out of 139 rows)
+Cascade (leave-one-seed-family-out) estimated cost per 1,000 tools scanned: $1.26
 
