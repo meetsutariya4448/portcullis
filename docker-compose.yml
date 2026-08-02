@@ -25,9 +25,21 @@ services:
   # does that for you. See bench/run_bench.sh for what each service is used
   # to measure.
 
+  # CPU limits below are deliberate, not decorative: this profile runs up to
+  # 5 of these containers concurrently (3 gateways + nginx + 1 upstream) on
+  # an 8-core host, alongside `hey` itself and Docker Desktop's own VM
+  # overhead. Without an explicit ceiling, docker compose lets every
+  # container burst across all 8 cores freely, which masks true per-request
+  # overhead behind scheduler contention. 1.0 cpu each keeps the "3 gateway
+  # instances" scenario's total container demand (5 cores) inside what the
+  # host can actually supply alongside its own overhead -- see
+  # run_bench.sh's CPU-contention check, which drops the 3-instance result
+  # from results.md if the numbers still show contention regardless.
+
   upstream-native:
     profiles: ["bench"]
     build: ./bench/upstream-native
+    cpus: "1.0"
     ports:
       - "9101:9101"
     healthcheck:
@@ -39,6 +51,7 @@ services:
   upstream-legacy:
     profiles: ["bench"]
     build: ./bench/upstream-legacy
+    cpus: "1.0"
     ports:
       - "9102:9102"
     healthcheck:
@@ -55,6 +68,7 @@ services:
     profiles: ["bench"]
     build: ./gateway
     command: ["-config", "/etc/portcullis/config.yaml", "-addr", ":8080"]
+    cpus: "1.0"
     volumes:
       - ./bench/configs/gateway.yaml:/etc/portcullis/config.yaml:ro
     ports:
@@ -74,6 +88,7 @@ services:
     profiles: ["bench"]
     build: ./gateway
     command: ["-config", "/etc/portcullis/config.yaml", "-addr", ":8080"]
+    cpus: "1.0"
     volumes:
       - ./bench/configs/gateway.yaml:/etc/portcullis/config.yaml:ro
     ports:
@@ -93,6 +108,7 @@ services:
     profiles: ["bench"]
     build: ./gateway
     command: ["-config", "/etc/portcullis/config.yaml", "-addr", ":8080"]
+    cpus: "1.0"
     volumes:
       - ./bench/configs/gateway.yaml:/etc/portcullis/config.yaml:ro
     ports:
@@ -112,6 +128,7 @@ services:
     profiles: ["bench"]
     build: ./gateway
     command: ["-config", "/etc/portcullis/config.yaml", "-addr", ":8080"]
+    cpus: "1.0"
     volumes:
       - ./bench/configs/gateway.yaml:/etc/portcullis/config.yaml:ro
     ports:
@@ -132,6 +149,7 @@ services:
   nginx-bench:
     profiles: ["bench"]
     image: nginx:1.27-alpine
+    cpus: "1.0"
     volumes:
       - ./bench/configs/nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
