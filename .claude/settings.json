@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go vet *)",
+      "Bash(gofmt -l .)",
+      "Bash(git reset *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git commit --amend -m 'feat\\(gateway\\): stateless 2026-07-28 data plane with header validation *)",
+      "Bash(chmod +x /Users/meetsutariya/Desktop/portcullis/bench/run_bench.sh)",
+      "Bash(bash -n /Users/meetsutariya/Desktop/portcullis/bench/run_bench.sh)",
+      "Bash(grep -nE 'declare -A|@Q|mapfile|readarray|\\\\$\\\\{[a-zA-Z_]+,,\\\\}|\\\\$\\\\{[a-zA-Z_]+\\\\^\\\\^\\\\}' /Users/meetsutariya/Desktop/portcullis/bench/run_bench.sh)",
+      "Bash(rm -f /tmp/fake_hey_output.txt /tmp/fake_hey_mixed.txt)",
+      "Bash(git commit -m 'feat\\(bench\\): gateway overhead benchmark harness *)"
+    ]
+  }
+}
