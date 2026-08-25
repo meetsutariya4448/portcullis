@@ -16,6 +16,7 @@ import (
 	"github.com/meetsutariya4448/portcullis/gateway/internal/auth"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/config"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/policy"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/ratelimit"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/secret"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/server"
@@ -48,6 +49,7 @@ func main() {
 	}
 
 	pol := buildPolicy(cfg.Policy)
+	limiter := buildRateLimiter(cfg.RateLimit)
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -61,6 +63,7 @@ func main() {
 		MaxInflight:   cfg.MaxInflightOrDefault(),
 		Authenticator: authenticator,
 		Policy:        pol,
+		RateLimiter:   limiter,
 	})
 	httpServer := &http.Server{Handler: srv}
 
@@ -72,7 +75,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled, "policy_rules", len(cfg.Policy.Rules))
+	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled, "policy_rules", len(cfg.Policy.Rules), "rate_limit_enabled", cfg.RateLimit.Enabled)
 	if err := run(ctx, stop, httpServer, listener, *shutdownTimeout, log); err != nil {
 		os.Exit(1)
 	}
@@ -130,6 +133,16 @@ func buildPolicy(cfg config.Policy) *policy.Policy {
 		})
 	}
 	return policy.New(rules)
+}
+
+// buildRateLimiter constructs a ratelimit.Limiter from cfg. Returns nil
+// when rate limiting is disabled: the server's rate-limit gate treats a
+// nil Limiter as "off," today's behavior, unchanged.
+func buildRateLimiter(cfg config.RateLimit) *ratelimit.Limiter {
+	if !cfg.Enabled {
+		return nil
+	}
+	return ratelimit.NewLimiter(cfg.RequestsPerSecond, cfg.Burst)
 }
 
 // run serves httpServer on listener until either it exits on its own (an

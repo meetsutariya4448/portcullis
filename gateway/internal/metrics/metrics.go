@@ -83,6 +83,13 @@ var (
 		Name: "portcullis_policy_denied_total",
 		Help: "Total requests denied by the policy engine, by client and namespace.",
 	}, []string{"client", "namespace"})
+
+	// RateLimitRejectedTotal counts requests rejected because a client
+	// exceeded its token-bucket rate limit.
+	RateLimitRejectedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_rate_limit_rejected_total",
+		Help: "Total requests rejected because the client exceeded its rate limit.",
+	}, []string{"client"})
 )
 
 func init() {
@@ -97,5 +104,6 @@ func init() {
 		BackpressureRejectedTotal,
 		AuthRejectedTotal,
 		PolicyDeniedTotal,
+		RateLimitRejectedTotal,
 	)
 }

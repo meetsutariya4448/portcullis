@@ -293,6 +293,55 @@ func TestConfig_Validate_AcceptsWellFormedPolicyRule(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_AcceptsConfigWithNoRateLimitBlock(t *testing.T) {
+	// Backward compatibility: an absent `rate_limit:` block means no
+	// client is ever rate-limited, unchanged, for any config that doesn't
+	// opt in.
+	if err := validConfig().validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_RejectsNegativeRequestsPerSecond(t *testing.T) {
+	cfg := validConfig()
+	cfg.RateLimit.RequestsPerSecond = -1
+	assertValidateError(t, cfg, "requests_per_second must be >= 0")
+}
+
+func TestConfig_Validate_RejectsNegativeBurst(t *testing.T) {
+	cfg := validConfig()
+	cfg.RateLimit.Burst = -1
+	assertValidateError(t, cfg, "burst must be >= 0")
+}
+
+func TestConfig_Validate_RejectsEnabledRateLimitWithNoRequestsPerSecond(t *testing.T) {
+	cfg := validConfig()
+	cfg.RateLimit = RateLimit{Enabled: true, Burst: 10}
+	assertValidateError(t, cfg, "requests_per_second must be > 0")
+}
+
+func TestConfig_Validate_RejectsEnabledRateLimitWithNoBurst(t *testing.T) {
+	cfg := validConfig()
+	cfg.RateLimit = RateLimit{Enabled: true, RequestsPerSecond: 10}
+	assertValidateError(t, cfg, "burst must be > 0")
+}
+
+func TestConfig_Validate_AllowsDisabledRateLimitWithZeroValues(t *testing.T) {
+	cfg := validConfig()
+	cfg.RateLimit = RateLimit{Enabled: false}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AcceptsWellFormedRateLimit(t *testing.T) {
+	cfg := validConfig()
+	cfg.RateLimit = RateLimit{Enabled: true, RequestsPerSecond: 50, Burst: 100}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func assertValidateError(t *testing.T, cfg *Config, wantSubstring string) {
 	t.Helper()
 	err := cfg.validate()

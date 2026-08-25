@@ -151,6 +151,19 @@ type Policy struct {
 	Rules []PolicyRule `yaml:"rules"`
 }
 
+// RateLimit configures the gateway-wide per-client token-bucket rate
+// limiter. Enabled defaults to false: an absent or disabled
+// `rate_limit:` block means no client is ever rate-limited, today's
+// behavior, unchanged, for any config that doesn't opt in. Every client
+// (keyed by its authenticated client ID, or "" if auth is disabled) gets
+// its own bucket at the same RequestsPerSecond/Burst — see
+// internal/ratelimit.
+type RateLimit struct {
+	Enabled           bool    `yaml:"enabled"`
+	RequestsPerSecond float64 `yaml:"requests_per_second"`
+	Burst             int     `yaml:"burst"`
+}
+
 // Upstream is one MCP server Portcullis can route to.
 type Upstream struct {
 	Name            string `yaml:"name"`
@@ -204,9 +217,10 @@ type Config struct {
 	Upstreams []Upstream `yaml:"upstreams"`
 	// MaxInflight bounds total concurrent /mcp requests gateway-wide
 	// (backpressure). Zero means "use defaultMaxInflight."
-	MaxInflight int    `yaml:"max_inflight"`
-	Auth        Auth   `yaml:"auth"`
-	Policy      Policy `yaml:"policy"`
+	MaxInflight int       `yaml:"max_inflight"`
+	Auth        Auth      `yaml:"auth"`
+	Policy      Policy    `yaml:"policy"`
+	RateLimit   RateLimit `yaml:"rate_limit"`
 }
 
 // MaxInflightOrDefault returns MaxInflight, falling back to
@@ -289,6 +303,25 @@ func (c *Config) validate() error {
 	}
 	if err := c.Policy.validate(); err != nil {
 		return err
+	}
+	if err := c.RateLimit.validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r RateLimit) validate() error {
+	if r.RequestsPerSecond < 0 {
+		return fmt.Errorf("rate_limit: requests_per_second must be >= 0, got %v", r.RequestsPerSecond)
+	}
+	if r.Burst < 0 {
+		return fmt.Errorf("rate_limit: burst must be >= 0, got %d", r.Burst)
+	}
+	if r.Enabled && r.RequestsPerSecond <= 0 {
+		return fmt.Errorf("rate_limit: requests_per_second must be > 0 when rate_limit is enabled")
+	}
+	if r.Enabled && r.Burst <= 0 {
+		return fmt.Errorf("rate_limit: burst must be > 0 when rate_limit is enabled")
 	}
 	return nil
 }

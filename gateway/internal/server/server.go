@@ -19,6 +19,7 @@ import (
 	gwmcp "github.com/meetsutariya4448/portcullis/gateway/internal/mcp"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/policy"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/ratelimit"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/translate"
@@ -58,6 +59,9 @@ type Options struct {
 	// entirely — equivalent to (but cheaper than) a Policy with zero
 	// rules, which also allows everything.
 	Policy *policy.Policy
+	// RateLimiter is optional. nil means no client is ever rate-limited —
+	// today's behavior, unchanged, for a config with no rate_limit: block.
+	RateLimiter *ratelimit.Limiter
 }
 
 // Server holds the dependencies shared by all handlers.
@@ -67,6 +71,7 @@ type Server struct {
 	mux           *http.ServeMux
 	authenticator *auth.Authenticator
 	policy        *policy.Policy
+	rateLimiter   *ratelimit.Limiter
 
 	// inflightSem bounds total concurrent /mcp handling gateway-wide —
 	// backpressure. A request that can't immediately acquire a slot is
@@ -86,6 +91,7 @@ func New(opts Options) *Server {
 		mux:           http.NewServeMux(),
 		authenticator: opts.Authenticator,
 		policy:        opts.Policy,
+		rateLimiter:   opts.RateLimiter,
 		inflightSem:   make(chan struct{}, maxInflight),
 	}
 	s.mux.HandleFunc("POST /mcp", s.handleMCP)
@@ -169,6 +175,13 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		metrics.AuthRejectedTotal.WithLabelValues(authRejectReason(err)).Inc()
 		s.writeGatewayError(w, r, "", "", http.StatusUnauthorized, nil, err.Error(), handlerStart, err)
+		return
+	}
+
+	if s.rateLimiter != nil && !s.rateLimiter.Allow(clientID) {
+		metrics.RateLimitRejectedTotal.WithLabelValues(clientID).Inc()
+		w.Header().Set("Retry-After", "1")
+		s.writeGatewayError(w, r, "", "", http.StatusTooManyRequests, nil, "rate limit exceeded", handlerStart, nil)
 		return
 	}
 
