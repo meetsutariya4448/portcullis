@@ -6,6 +6,24 @@ import (
 	"time"
 )
 
+func TestUpstream_TimeoutDuration_DefaultsWhenUnset(t *testing.T) {
+	u := Upstream{Name: "x"}
+	d, err := u.TimeoutDuration()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if d != defaultUpstreamTimeout {
+		t.Fatalf("expected default %v, got %v", defaultUpstreamTimeout, d)
+	}
+}
+
+func TestUpstream_TimeoutDuration_InvalidReturnsError(t *testing.T) {
+	u := Upstream{Name: "x", Timeout: "not-a-duration"}
+	if _, err := u.TimeoutDuration(); err == nil {
+		t.Fatal("expected an error for an invalid timeout string")
+	}
+}
+
 func TestRetryPolicy_DurationParsing(t *testing.T) {
 	unset := RetryPolicy{}
 	if d, err := unset.BaseDelayDuration(); err != nil || d != 0 {
@@ -33,6 +51,12 @@ func validConfig() *Config {
 	return &Config{Upstreams: []Upstream{
 		{Name: "weather", Namespace: "weather", URL: "http://localhost:9001/mcp"},
 	}}
+}
+
+func TestConfig_Validate_AcceptsValidConfig(t *testing.T) {
+	if err := validConfig().validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestUpstream_MaxConcurrentOrDefault(t *testing.T) {
