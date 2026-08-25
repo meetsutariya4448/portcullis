@@ -407,6 +407,66 @@ func TestConfig_Validate_AcceptsWellFormedQuota(t *testing.T) {
 	}
 }
 
+func TestTracing_SampleRatioOrDefault(t *testing.T) {
+	if got := (Tracing{}).SampleRatioOrDefault(); got != 1.0 {
+		t.Fatalf("expected default 1.0, got %v", got)
+	}
+	if got := (Tracing{SampleRatio: 0.25}).SampleRatioOrDefault(); got != 0.25 {
+		t.Fatalf("expected 0.25, got %v", got)
+	}
+}
+
+func TestTracing_ServiceNameOrDefault(t *testing.T) {
+	if got := (Tracing{}).ServiceNameOrDefault(); got != defaultTracingServiceName {
+		t.Fatalf("expected default %q, got %q", defaultTracingServiceName, got)
+	}
+	if got := (Tracing{ServiceName: "custom"}).ServiceNameOrDefault(); got != "custom" {
+		t.Fatalf("expected %q, got %q", "custom", got)
+	}
+}
+
+func TestConfig_Validate_AcceptsConfigWithNoTracingBlock(t *testing.T) {
+	// Backward compatibility: an absent `tracing:` block means zero
+	// tracing overhead, unchanged, for any config that doesn't opt in.
+	if err := validConfig().validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_RejectsOutOfRangeSampleRatio(t *testing.T) {
+	cfg := validConfig()
+	cfg.Tracing.SampleRatio = 1.5
+	assertValidateError(t, cfg, "sample_ratio must be in [0,1]")
+}
+
+func TestConfig_Validate_RejectsNegativeSampleRatio(t *testing.T) {
+	cfg := validConfig()
+	cfg.Tracing.SampleRatio = -0.1
+	assertValidateError(t, cfg, "sample_ratio must be in [0,1]")
+}
+
+func TestConfig_Validate_RejectsEnabledTracingWithNoEndpoint(t *testing.T) {
+	cfg := validConfig()
+	cfg.Tracing = Tracing{Enabled: true}
+	assertValidateError(t, cfg, "otlp_endpoint is required")
+}
+
+func TestConfig_Validate_AllowsDisabledTracingWithNoEndpoint(t *testing.T) {
+	cfg := validConfig()
+	cfg.Tracing = Tracing{Enabled: false}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AcceptsWellFormedTracing(t *testing.T) {
+	cfg := validConfig()
+	cfg.Tracing = Tracing{Enabled: true, OTLPEndpoint: "localhost:4318", SampleRatio: 0.5, ServiceName: "portcullis-bench"}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func assertValidateError(t *testing.T, cfg *Config, wantSubstring string) {
 	t.Helper()
 	err := cfg.validate()

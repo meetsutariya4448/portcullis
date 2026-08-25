@@ -188,6 +188,41 @@ func (q Quota) WindowDuration() (time.Duration, error) {
 	return d, nil
 }
 
+// defaultTracingServiceName is used for the OTel resource's service.name
+// attribute when Tracing.ServiceName is unset.
+const defaultTracingServiceName = "portcullis"
+
+// Tracing configures OpenTelemetry distributed tracing. Enabled defaults
+// to false: an absent or disabled `tracing:` block means zero tracing
+// overhead and no global tracer provider is ever installed, today's
+// behavior, unchanged, for any config that doesn't opt in. SampleRatio's
+// zero value means "sample everything" (ratio 1.0) — same zero-sentinel
+// convention as CircuitBreakerPolicy.Threshold. See internal/tracing.
+type Tracing struct {
+	Enabled      bool    `yaml:"enabled"`
+	OTLPEndpoint string  `yaml:"otlp_endpoint"`
+	SampleRatio  float64 `yaml:"sample_ratio"`
+	ServiceName  string  `yaml:"service_name"`
+}
+
+// SampleRatioOrDefault returns SampleRatio, falling back to 1.0 (always
+// sample) when unset.
+func (t Tracing) SampleRatioOrDefault() float64 {
+	if t.SampleRatio <= 0 {
+		return 1.0
+	}
+	return t.SampleRatio
+}
+
+// ServiceNameOrDefault returns ServiceName, falling back to
+// defaultTracingServiceName when unset.
+func (t Tracing) ServiceNameOrDefault() string {
+	if t.ServiceName == "" {
+		return defaultTracingServiceName
+	}
+	return t.ServiceName
+}
+
 // Upstream is one MCP server Portcullis can route to.
 type Upstream struct {
 	Name            string `yaml:"name"`
@@ -246,6 +281,7 @@ type Config struct {
 	Policy      Policy    `yaml:"policy"`
 	RateLimit   RateLimit `yaml:"rate_limit"`
 	Quota       Quota     `yaml:"quota"`
+	Tracing     Tracing   `yaml:"tracing"`
 }
 
 // MaxInflightOrDefault returns MaxInflight, falling back to
@@ -334,6 +370,19 @@ func (c *Config) validate() error {
 	}
 	if err := c.Quota.validate(); err != nil {
 		return err
+	}
+	if err := c.Tracing.validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t Tracing) validate() error {
+	if t.SampleRatio < 0 || t.SampleRatio > 1 {
+		return fmt.Errorf("tracing: sample_ratio must be in [0,1], got %v", t.SampleRatio)
+	}
+	if t.Enabled && t.OTLPEndpoint == "" {
+		return fmt.Errorf("tracing: otlp_endpoint is required when tracing is enabled")
 	}
 	return nil
 }

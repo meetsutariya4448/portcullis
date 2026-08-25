@@ -21,6 +21,7 @@ import (
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/secret"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/server"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/tracing"
 )
 
 func main() {
@@ -57,6 +58,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	tracerProvider, err := tracing.BuildProvider(context.Background(), cfg.Tracing)
+	if err != nil {
+		log.Error("failed to build tracer provider", "error", err)
+		os.Exit(1)
+	}
+
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Error("failed to bind", "addr", *addr, "error", err)
@@ -82,8 +89,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled, "policy_rules", len(cfg.Policy.Rules), "rate_limit_enabled", cfg.RateLimit.Enabled, "quota_enabled", cfg.Quota.Enabled)
-	if err := run(ctx, stop, httpServer, listener, *shutdownTimeout, log); err != nil {
+	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled, "policy_rules", len(cfg.Policy.Rules), "rate_limit_enabled", cfg.RateLimit.Enabled, "quota_enabled", cfg.Quota.Enabled, "tracing_enabled", cfg.Tracing.Enabled)
+	runErr := run(ctx, stop, httpServer, listener, *shutdownTimeout, log)
+
+	if tracerProvider != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := tracerProvider.Shutdown(shutdownCtx); err != nil {
+			log.Error("failed to flush trace exporter", "error", err)
+		}
+		cancel()
+	}
+
+	if runErr != nil {
 		os.Exit(1)
 	}
 }
