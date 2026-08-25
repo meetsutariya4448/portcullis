@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/meetsutariya4448/portcullis/gateway/internal/config"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/translate"
@@ -72,19 +74,30 @@ func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 			return nil, err
 		}
 
+		transport := &http.Transport{
+			MaxIdleConnsPerHost: maxIdleConnsPerUpstream,
+			IdleConnTimeout:     90 * time.Second,
+			// Wraps the same dialer net/http would use by default
+			// (DialContext left nil) — behavior is unchanged, but now
+			// a successful dial is observable via retry.WithConnProbe,
+			// which is what lets the native forward path retry a
+			// pre-connect failure while never retrying a request that
+			// actually reached the upstream.
+			DialContext: retry.ProbeDialContext((&net.Dialer{}).DialContext),
+		}
 		client := &http.Client{
 			Timeout: timeout,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: maxIdleConnsPerUpstream,
-				IdleConnTimeout:     90 * time.Second,
-				// Wraps the same dialer net/http would use by default
-				// (DialContext left nil) — behavior is unchanged, but now
-				// a successful dial is observable via retry.WithConnProbe,
-				// which is what lets the native forward path retry a
-				// pre-connect failure while never retrying a request that
-				// actually reached the upstream.
-				DialContext: retry.ProbeDialContext((&net.Dialer{}).DialContext),
-			},
+			// otelhttp.NewTransport wraps the dial-probed transport one
+			// layer further: it starts a client-side span per real
+			// outbound call and injects the active trace context as a
+			// traceparent header, via whatever propagator
+			// internal/tracing installed globally (a no-op when tracing
+			// is disabled). One wrapping point here instruments BOTH
+			// the native forward path (upstream.Client.Do) and the
+			// legacy path (translate.Pool is handed this same client),
+			// so an upstream that's also instrumented joins the same
+			// trace across the proxy boundary either way.
+			Transport: otelhttp.NewTransport(transport),
 		}
 		upstream := &Upstream{
 			Name:            u.Name,

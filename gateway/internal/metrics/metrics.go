@@ -97,6 +97,23 @@ var (
 		Name: "portcullis_quota_rejected_total",
 		Help: "Total requests rejected because the client exceeded its quota.",
 	}, []string{"client"})
+
+	// UpstreamLatency measures pure upstream round-trip time — the
+	// forward() call's duration, excluding Portcullis's own header
+	// parsing/routing/marshaling overhead (that's GatewayLatency's job).
+	UpstreamLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "portcullis_upstream_latency_seconds",
+		Help:    "Upstream round-trip time per request, excluding gateway-only overhead.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"upstream", "status"})
+
+	// BulkheadRejectedTotal counts requests rejected because a per-upstream
+	// bulkhead slot could not be acquired (distinct from every other
+	// forward failure — see forwardNative).
+	BulkheadRejectedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_bulkhead_rejected_total",
+		Help: "Total requests rejected because a per-upstream bulkhead slot could not be acquired.",
+	}, []string{"upstream"})
 )
 
 func init() {
@@ -113,5 +130,7 @@ func init() {
 		PolicyDeniedTotal,
 		RateLimitRejectedTotal,
 		QuotaRejectedTotal,
+		UpstreamLatency,
+		BulkheadRejectedTotal,
 	)
 }

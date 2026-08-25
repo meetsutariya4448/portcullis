@@ -14,6 +14,12 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/meetsutariya4448/portcullis/gateway/internal/auth"
 	gwmcp "github.com/meetsutariya4448/portcullis/gateway/internal/mcp"
@@ -35,6 +41,13 @@ const maxBodyBytes = 10 << 20 // 10MiB
 // upstream MCP server and is forwarded through unchanged by copyHeaders —
 // Portcullis's own auth needs a header of its own so the two never collide.
 const apiKeyHeader = "X-Portcullis-Api-Key"
+
+// tracer is Portcullis's tracer for the request pipeline. When no
+// TracerProvider has been installed (tracing disabled — see
+// internal/tracing), otel.Tracer returns OpenTelemetry's built-in no-op
+// implementation, so every call site below needs no "is tracing on"
+// branching of its own.
+var tracer = otel.Tracer("portcullis/server")
 
 // hopByHopHeaders are stripped when forwarding a request or response, per
 // RFC 9110's hop-by-hop header list — they describe this specific
@@ -163,6 +176,24 @@ func authRejectReason(err error) string {
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	handlerStart := time.Now()
 
+	// Extract any incoming traceparent before starting our own span, so a
+	// caller that's already tracing this call joins the same trace instead
+	// of Portcullis silently starting a disconnected one. otelhttp's
+	// outbound transport (see router.New) injects a traceparent on the way
+	// to the upstream using the same global propagator, so a request that
+	// arrives already-traced stays in one trace end to end. Reassigning
+	// r's context (rather than threading a separate ctx variable) means
+	// every r.Context() call below -- including inside
+	// writeGatewayError/writeJSONRPCError, which aren't otherwise touched
+	// -- sees the active span with no further call-site changes.
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	ctx, span := tracer.Start(ctx, "mcp.handle", trace.WithAttributes(
+		semconv.HTTPRequestMethodPost,
+		semconv.HTTPRoute("/mcp"),
+	))
+	r = r.WithContext(ctx)
+	defer span.End()
+
 	select {
 	case s.inflightSem <- struct{}{}:
 	default:
@@ -183,6 +214,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		s.writeGatewayError(w, r, "", "", http.StatusUnauthorized, nil, err.Error(), handlerStart, err)
 		return
 	}
+	span.SetAttributes(attribute.String("portcullis.client_id", clientID))
 
 	if s.rateLimiter != nil && !s.rateLimiter.Allow(clientID) {
 		metrics.RateLimitRejectedTotal.WithLabelValues(clientID).Inc()
@@ -227,6 +259,11 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 			"request is not namespace-qualified (\"{namespace}.{tool}\"); Portcullis cannot route it", handlerStart, nil)
 		return
 	}
+	span.SetAttributes(
+		semconv.RPCMethod(req.Method),
+		attribute.String("mcp.tool", headers.Name),
+		attribute.String("mcp.namespace", namespace),
+	)
 
 	if allow, reason := s.authorize(clientID, namespace, tool); !allow {
 		metrics.PolicyDeniedTotal.WithLabelValues(clientID, namespace).Inc()
@@ -239,17 +276,24 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		s.writeGatewayError(w, r, req.Method, headers.Name, http.StatusBadGateway, req.ID, err.Error(), handlerStart, err)
 		return
 	}
+	span.SetAttributes(attribute.String("portcullis.upstream", upstream.Name))
 
 	preUpstream := time.Since(handlerStart)
 
 	upstreamStart := time.Now()
-	resp, err := s.forward(r.Context(), upstream, body, r.Header)
+	forwardCtx, forwardSpan := tracer.Start(r.Context(), "portcullis.forward",
+		trace.WithAttributes(attribute.String("portcullis.upstream", upstream.Name)))
+	resp, err := s.forward(forwardCtx, upstream, body, r.Header)
 	upstreamDuration := time.Since(upstreamStart)
 	if err != nil {
 		httpStatus, message := translateForwardError(err)
+		forwardSpan.SetStatus(codes.Error, message)
+		forwardSpan.End()
+		metrics.UpstreamLatency.WithLabelValues(upstream.Name, strconv.Itoa(httpStatus)).Observe(upstreamDuration.Seconds())
 		s.writeGatewayError(w, r, req.Method, headers.Name, httpStatus, req.ID, message, handlerStart, err)
 		return
 	}
+	forwardSpan.End()
 	defer resp.Body.Close()
 
 	postStart := time.Now()
@@ -262,9 +306,11 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	status := strconv.Itoa(resp.StatusCode)
 	metrics.RequestsTotal.WithLabelValues(req.Method, headers.Name, status).Inc()
 	metrics.GatewayLatency.WithLabelValues(req.Method, headers.Name, status).Observe(gatewayOverhead.Seconds())
+	metrics.UpstreamLatency.WithLabelValues(upstream.Name, status).Observe(upstreamDuration.Seconds())
+	span.SetAttributes(semconv.HTTPResponseStatusCode(resp.StatusCode))
 
 	totalDuration := time.Since(handlerStart)
-	logArgs := []any{
+	logArgs := append([]any{
 		"method", req.Method,
 		"tool", headers.Name,
 		"upstream", upstream.Name,
@@ -272,12 +318,26 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		"duration_ms", totalDuration.Milliseconds(),
 		"status", resp.StatusCode,
 		"upstream_duration_ms", upstreamDuration.Milliseconds(),
-	}
+	}, traceLogArgs(r.Context())...)
 	if copyErr != nil {
+		span.SetStatus(codes.Error, copyErr.Error())
 		s.log.Error("mcp request: failed writing response body", append(logArgs, "error", copyErr)...)
 		return
 	}
+	span.SetStatus(codes.Ok, "")
 	s.log.Info("mcp request", logArgs...)
+}
+
+// traceLogArgs returns slog key/value pairs correlating a log line with
+// its trace, or nil when ctx carries no valid (i.e. tracing is disabled
+// or sampled-out) span context -- the concrete link between "structured
+// logs" and "OTel tracing."
+func traceLogArgs(ctx context.Context) []any {
+	sc := trace.SpanFromContext(ctx).SpanContext()
+	if !sc.IsValid() {
+		return nil
+	}
+	return []any{"trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String()}
 }
 
 // forward dispatches to the legacy or native forward path and wraps the
@@ -292,6 +352,7 @@ func (s *Server) forward(ctx context.Context, upstream *router.Upstream, body []
 	var resp *http.Response
 	err := retry.Do(ctx, upstream.RetryConfig, func(attempt int) error {
 		metrics.RetryAttemptsTotal.WithLabelValues(upstream.Name).Inc()
+		trace.SpanFromContext(ctx).AddEvent("attempt", trace.WithAttributes(attribute.Int("attempt", attempt)))
 
 		var attemptErr error
 		if upstream.LegacyPool != nil {
@@ -318,6 +379,7 @@ func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, b
 
 	waitStart := time.Now()
 	if err := upstream.Bulkhead.Acquire(ctx); err != nil {
+		metrics.BulkheadRejectedTotal.WithLabelValues(upstream.Name).Inc()
 		return nil, retry.NonRetryable(err)
 	}
 	metrics.BulkheadWaitSeconds.WithLabelValues(upstream.Name).Observe(time.Since(waitStart).Seconds())
@@ -358,18 +420,23 @@ func (s *Server) writeJSONRPCError(w http.ResponseWriter, r *http.Request, metho
 	w.WriteHeader(httpStatus)
 	_ = json.NewEncoder(w).Encode(resp)
 
+	span := trace.SpanFromContext(r.Context())
+	span.SetAttributes(semconv.HTTPResponseStatusCode(httpStatus))
+	span.SetStatus(codes.Error, resp.Error.Message)
+
 	duration := time.Since(handlerStart)
 	status := strconv.Itoa(httpStatus)
 	metrics.RequestsTotal.WithLabelValues(method, tool, status).Inc()
 	metrics.GatewayLatency.WithLabelValues(method, tool, status).Observe(duration.Seconds())
-	s.log.Warn("mcp request rejected",
+	logArgs := append([]any{
 		"method", method,
 		"tool", tool,
 		"duration_ms", duration.Milliseconds(),
 		"status", httpStatus,
 		"error_code", resp.Error.Code,
 		"error_message", resp.Error.Message,
-	)
+	}, traceLogArgs(r.Context())...)
+	s.log.Warn("mcp request rejected", logArgs...)
 }
 
 // writeGatewayError writes a generic JSON-RPC error response for failures
@@ -388,17 +455,21 @@ func (s *Server) writeGatewayError(w http.ResponseWriter, r *http.Request, metho
 	w.WriteHeader(httpStatus)
 	_ = json.NewEncoder(w).Encode(resp)
 
+	span := trace.SpanFromContext(r.Context())
+	span.SetAttributes(semconv.HTTPResponseStatusCode(httpStatus))
+	span.SetStatus(codes.Error, message)
+
 	duration := time.Since(handlerStart)
 	status := strconv.Itoa(httpStatus)
 	metrics.RequestsTotal.WithLabelValues(method, tool, status).Inc()
 	metrics.GatewayLatency.WithLabelValues(method, tool, status).Observe(duration.Seconds())
-	logArgs := []any{
+	logArgs := append([]any{
 		"method", method,
 		"tool", tool,
 		"duration_ms", duration.Milliseconds(),
 		"status", httpStatus,
 		"message", message,
-	}
+	}, traceLogArgs(r.Context())...)
 	if cause != nil {
 		logArgs = append(logArgs, "error", cause)
 	}
