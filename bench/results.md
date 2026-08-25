@@ -7,7 +7,38 @@
 > time. Do not treat these as portable performance claims — re-run this
 > script on your own target hardware before relying on them.
 
-Generated: 2026-08-02T22:58:28Z
+Generated: 2026-08-25T04:25:51Z
+
+## Milestone 1 (resilience core) note
+
+This run measures the gateway **after** Milestone 1 added retries, native
+bulkhead isolation, an improved circuit breaker (native + legacy), graceful
+shutdown, and backpressure — all of which add some per-request bookkeeping
+(a semaphore acquire/release, breaker Allow/Record, a retry.Do wrapper) even
+on the successful, non-retried, non-saturated path. The added-latency
+numbers below reflect that real cost.
+
+**Read the baseline column with extra caution on this run specifically.**
+Docker Desktop had just been freshly restarted immediately before this
+benchmark ran, and was given only ~10–50s to report ready before the
+build+bench started — the VM was likely not fully warmed up. That shows up
+as baseline noise that has nothing to do with Portcullis: native
+direct-to-upstream p50 came in at 6.30ms here, versus ~1.4–1.7ms in prior
+(pre-Milestone-1) runs on the same host, even though the baseline path
+never touches any gateway code Milestone 1 changed. The *added-latency*
+deltas below are still the real, honestly-measured numbers from this run —
+per the project's standing rule, they are not re-run or smoothed to look
+better — but a controlled run on an already-warm Docker instance would be
+a fairer read of Milestone 1's true steady-state overhead. That controlled
+run, when done, will be recorded as an additional dated result below, not
+a replacement for this one.
+
+**3-instance scaling is explicitly excluded from this run's numbers**,
+same as every prior run on this 8-core host: the CPU-contention check in
+`bench/run_bench.sh` tripped for both upstreams (see the dropped rows in
+Results and Added Latency below), so no 3-instance figure is reported —
+not because it wasn't measured, but because what was measured was
+contention on this machine, not Portcullis's own scaling behavior.
 
 ## Machine
 
@@ -66,7 +97,7 @@ hey -n 5000 -c 50 -m POST -T application/json -D /Users/meetsutariya/Desktop/por
 hey -n 5000 -c 50 -m POST -T application/json -D /Users/meetsutariya/Desktop/portcullis/bench/.raw/native-body.json -H MCP-Protocol-Version:\ 2026-07-28 -H Mcp-Method:\ tools/call -H Mcp-Name:\ native.echo http://localhost:8090/mcp 
 
 # legacy-baseline
-hey -n 5000 -c 50 -m POST -T application/json -D /Users/meetsutariya/Desktop/portcullis/bench/.raw/legacy-body.json -H MCP-Protocol-Version:\ 2026-07-28 -H Mcp-Method:\ tools/call -H Mcp-Name:\ legacy.echo -H Mcp-Session-Id:\ 63583e3059987d50391abc1e224364ac http://localhost:9102/mcp 
+hey -n 5000 -c 50 -m POST -T application/json -D /Users/meetsutariya/Desktop/portcullis/bench/.raw/legacy-body.json -H MCP-Protocol-Version:\ 2026-07-28 -H Mcp-Method:\ tools/call -H Mcp-Name:\ legacy.echo -H Mcp-Session-Id:\ e7919c3a686a44bde14d8dd6d968e143 http://localhost:9102/mcp 
 
 # legacy-1-instance
 hey -n 5000 -c 50 -m POST -T application/json -D /Users/meetsutariya/Desktop/portcullis/bench/.raw/legacy-body.json -H MCP-Protocol-Version:\ 2026-07-28 -H Mcp-Method:\ tools/call -H Mcp-Name:\ legacy.echo http://localhost:8081/mcp 
@@ -80,20 +111,20 @@ hey -n 5000 -c 50 -m POST -T application/json -D /Users/meetsutariya/Desktop/por
 
 | Scenario | Target | p50 ms (min–max) | p95 (ms) | p99 ms (min–max) | req/s | Non-200 responses |
 |---|---|---|---:|---|---:|---|
-| direct to upstream (baseline) | native | 1.40 (1.40–1.50) | 2.70 | 17.20 (3.90–24.50) | 27963.9647 | none |
-| through 1 gateway instance | native | 2.70 (2.40–2.90) | 11.90 | 52.20 (48.20–60.70) | 10432.5011 | none |
+| direct to upstream (baseline) | native | 6.30 (4.00–6.90) | 31.60 | 47.60 (40.60–123.00) | 4317.3924 | none |
+| through 1 gateway instance | native | 7.10 (4.30–7.60) | 54.30 | 149.00 (59.50–172.60) | 3034.5321 | none |
 | through 3 gateway instances | native | *dropped -- CPU contention on this 8-core host, not a scaling measurement* | | | | |
-| direct to upstream (baseline) | legacy | 1.90 (1.50–1.90) | 5.90 | 44.80 (18.20–45.70) | 17173.4062 | none |
-| through 1 gateway instance | legacy | 5.00 (4.30–5.30) | 53.30 | 61.40 (59.40–61.50) | 4645.4422 | none |
+| direct to upstream (baseline) | legacy | 1.80 (1.60–2.30) | 3.40 | 30.20 (14.60–45.10) | 21868.0410 | none |
+| through 1 gateway instance | legacy | 7.70 (5.90–8.50) | 60.70 | 70.90 (68.10–133.80) | 3086.2027 | none |
 | through 3 gateway instances | legacy | *dropped -- CPU contention on this 8-core host, not a scaling measurement* | | | | |
 
 ## Added latency (gateway − baseline, median of 3 reps)
 
 | Upstream | Topology | Added p50 latency (ms) | Added p99 latency (ms) |
 |---|---|---:|---:|
-| native | 1 gateway instance | 1.30 | 35.00 |
+| native | 1 gateway instance | 0.80 | 101.40 |
 | native | 3 gateway instances | *dropped -- CPU contention, not measurable on this hardware* | |
-| legacy | 1 gateway instance | 3.10 | 16.60 |
+| legacy | 1 gateway instance | 5.90 | 40.70 |
 | legacy | 3 gateway instances | *dropped -- CPU contention, not measurable on this hardware* | |
 
 p50 is reported alongside p99 here deliberately: at 5000 requests,
