@@ -75,6 +75,14 @@ var (
 		Name: "portcullis_auth_rejected_total",
 		Help: "Total requests rejected by gateway-edge authentication, by reason.",
 	}, []string{"reason"})
+
+	// PolicyDeniedTotal counts requests denied by the policy engine, by
+	// client and namespace (not by tool — that would make the label set
+	// unbounded for a fleet with many tools).
+	PolicyDeniedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_policy_denied_total",
+		Help: "Total requests denied by the policy engine, by client and namespace.",
+	}, []string{"client", "namespace"})
 )
 
 func init() {
@@ -88,5 +96,6 @@ func init() {
 		InflightRequests,
 		BackpressureRejectedTotal,
 		AuthRejectedTotal,
+		PolicyDeniedTotal,
 	)
 }

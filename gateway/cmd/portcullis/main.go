@@ -15,6 +15,7 @@ import (
 
 	"github.com/meetsutariya4448/portcullis/gateway/internal/auth"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/config"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/policy"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/secret"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/server"
@@ -46,6 +47,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	pol := buildPolicy(cfg.Policy)
+
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Error("failed to bind", "addr", *addr, "error", err)
@@ -57,6 +60,7 @@ func main() {
 		Log:           log,
 		MaxInflight:   cfg.MaxInflightOrDefault(),
 		Authenticator: authenticator,
+		Policy:        pol,
 	})
 	httpServer := &http.Server{Handler: srv}
 
@@ -68,7 +72,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled)
+	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled, "policy_rules", len(cfg.Policy.Rules))
 	if err := run(ctx, stop, httpServer, listener, *shutdownTimeout, log); err != nil {
 		os.Exit(1)
 	}
@@ -108,6 +112,24 @@ func buildAuthenticator(cfg config.Auth) (*auth.Authenticator, error) {
 		})
 	}
 	return auth.New(clients), nil
+}
+
+// buildPolicy constructs a policy.Policy from cfg. An empty Rules list
+// (no policy: block, or one present with no rules) still returns a
+// non-nil Policy — Evaluate treats zero rules as "allow everything," so
+// this needs no special-casing the way buildAuthenticator's disabled
+// case does.
+func buildPolicy(cfg config.Policy) *policy.Policy {
+	rules := make([]policy.Rule, 0, len(cfg.Rules))
+	for _, r := range cfg.Rules {
+		rules = append(rules, policy.Rule{
+			Client:    r.Client,
+			Namespace: r.Namespace,
+			Tools:     r.Tools,
+			Effect:    r.Effect,
+		})
+	}
+	return policy.New(rules)
 }
 
 // run serves httpServer on listener until either it exits on its own (an

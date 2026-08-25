@@ -246,6 +246,53 @@ func TestConfig_Validate_AcceptsKeyRotationTwoKeysSameClient(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_AcceptsConfigWithNoPolicyBlock(t *testing.T) {
+	// Backward compatibility: an absent `policy:` block means every
+	// request is allowed through, unchanged, for any config that doesn't
+	// opt in.
+	if err := validConfig().validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_RejectsPolicyRuleWithNoClient(t *testing.T) {
+	cfg := validConfig()
+	cfg.Policy.Rules = []PolicyRule{{Namespace: "weather", Tools: []string{"*"}, Effect: "allow"}}
+	assertValidateError(t, cfg, "client is required")
+}
+
+func TestConfig_Validate_RejectsPolicyRuleWithNoNamespace(t *testing.T) {
+	cfg := validConfig()
+	cfg.Policy.Rules = []PolicyRule{{Client: "acme", Tools: []string{"*"}, Effect: "allow"}}
+	assertValidateError(t, cfg, "namespace is required")
+}
+
+func TestConfig_Validate_RejectsPolicyRuleWithNoTools(t *testing.T) {
+	cfg := validConfig()
+	cfg.Policy.Rules = []PolicyRule{{Client: "acme", Namespace: "weather", Effect: "allow"}}
+	assertValidateError(t, cfg, "tools is required")
+}
+
+func TestConfig_Validate_RejectsPolicyRuleWithEmptyToolEntry(t *testing.T) {
+	cfg := validConfig()
+	cfg.Policy.Rules = []PolicyRule{{Client: "acme", Namespace: "weather", Tools: []string{""}, Effect: "allow"}}
+	assertValidateError(t, cfg, "empty entry")
+}
+
+func TestConfig_Validate_RejectsPolicyRuleWithInvalidEffect(t *testing.T) {
+	cfg := validConfig()
+	cfg.Policy.Rules = []PolicyRule{{Client: "acme", Namespace: "weather", Tools: []string{"*"}, Effect: "maybe"}}
+	assertValidateError(t, cfg, "effect must be")
+}
+
+func TestConfig_Validate_AcceptsWellFormedPolicyRule(t *testing.T) {
+	cfg := validConfig()
+	cfg.Policy.Rules = []PolicyRule{{Client: "*", Namespace: "*", Tools: []string{"*"}, Effect: "allow"}}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func assertValidateError(t *testing.T, cfg *Config, wantSubstring string) {
 	t.Helper()
 	err := cfg.validate()

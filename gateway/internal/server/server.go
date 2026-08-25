@@ -18,6 +18,7 @@ import (
 	"github.com/meetsutariya4448/portcullis/gateway/internal/auth"
 	gwmcp "github.com/meetsutariya4448/portcullis/gateway/internal/mcp"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/policy"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/translate"
@@ -53,6 +54,10 @@ type Options struct {
 	// disabled and every request is allowed through unauthenticated —
 	// today's behavior, unchanged, for a config with no auth: block.
 	Authenticator *auth.Authenticator
+	// Policy is optional. nil means the authorization gate is skipped
+	// entirely — equivalent to (but cheaper than) a Policy with zero
+	// rules, which also allows everything.
+	Policy *policy.Policy
 }
 
 // Server holds the dependencies shared by all handlers.
@@ -61,6 +66,7 @@ type Server struct {
 	log           *slog.Logger
 	mux           *http.ServeMux
 	authenticator *auth.Authenticator
+	policy        *policy.Policy
 
 	// inflightSem bounds total concurrent /mcp handling gateway-wide —
 	// backpressure. A request that can't immediately acquire a slot is
@@ -79,6 +85,7 @@ func New(opts Options) *Server {
 		log:           opts.Log,
 		mux:           http.NewServeMux(),
 		authenticator: opts.Authenticator,
+		policy:        opts.Policy,
 		inflightSem:   make(chan struct{}, maxInflight),
 	}
 	s.mux.HandleFunc("POST /mcp", s.handleMCP)
@@ -109,6 +116,16 @@ func (s *Server) authenticate(r *http.Request) (clientID string, err error) {
 		return "", err
 	}
 	return client.ID, nil
+}
+
+// authorize decides whether clientID may call tool in namespace. When no
+// Policy is configured, every request is allowed through — today's
+// behavior, unchanged, for a config with no policy: block.
+func (s *Server) authorize(clientID, namespace, tool string) (allow bool, reason string) {
+	if s.policy == nil {
+		return true, ""
+	}
+	return s.policy.Evaluate(clientID, namespace, tool)
 }
 
 // authRejectReason maps an auth error to a stable, low-cardinality metric
@@ -179,10 +196,16 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	namespace, _, ok := router.SplitName(headers.Name)
+	namespace, tool, ok := router.SplitName(headers.Name)
 	if !ok {
 		s.writeGatewayError(w, r, req.Method, headers.Name, http.StatusBadGateway, req.ID,
 			"request is not namespace-qualified (\"{namespace}.{tool}\"); Portcullis cannot route it", handlerStart, nil)
+		return
+	}
+
+	if allow, reason := s.authorize(clientID, namespace, tool); !allow {
+		metrics.PolicyDeniedTotal.WithLabelValues(clientID, namespace).Inc()
+		s.writeGatewayError(w, r, req.Method, headers.Name, http.StatusForbidden, req.ID, reason, handlerStart, nil)
 		return
 	}
 

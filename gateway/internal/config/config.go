@@ -132,6 +132,25 @@ type Auth struct {
 	Clients []AuthClient `yaml:"clients"`
 }
 
+// PolicyRule is one authorization rule: Client and Namespace match a
+// literal value or "*" (any); Tools matches if the target tool is listed
+// or Tools contains "*". Effect must be "allow" or "deny".
+type PolicyRule struct {
+	Client    string   `yaml:"client"`
+	Namespace string   `yaml:"namespace"`
+	Tools     []string `yaml:"tools"`
+	Effect    string   `yaml:"effect"`
+}
+
+// Policy configures the (client, namespace, tool) authorization gate. An
+// empty Rules list means "no policy configured" — every request is
+// allowed through, today's behavior, unchanged, for any config that
+// doesn't opt in. Once Rules is non-empty, evaluation is first-match-wins
+// and anything no rule matches is denied — see internal/policy.
+type Policy struct {
+	Rules []PolicyRule `yaml:"rules"`
+}
+
 // Upstream is one MCP server Portcullis can route to.
 type Upstream struct {
 	Name            string `yaml:"name"`
@@ -185,8 +204,9 @@ type Config struct {
 	Upstreams []Upstream `yaml:"upstreams"`
 	// MaxInflight bounds total concurrent /mcp requests gateway-wide
 	// (backpressure). Zero means "use defaultMaxInflight."
-	MaxInflight int  `yaml:"max_inflight"`
-	Auth        Auth `yaml:"auth"`
+	MaxInflight int    `yaml:"max_inflight"`
+	Auth        Auth   `yaml:"auth"`
+	Policy      Policy `yaml:"policy"`
 }
 
 // MaxInflightOrDefault returns MaxInflight, falling back to
@@ -266,6 +286,32 @@ func (c *Config) validate() error {
 	}
 	if err := c.Auth.validate(); err != nil {
 		return err
+	}
+	if err := c.Policy.validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p Policy) validate() error {
+	for i, r := range p.Rules {
+		if r.Client == "" {
+			return fmt.Errorf("policy: rule %d: client is required (use \"*\" to match any client)", i)
+		}
+		if r.Namespace == "" {
+			return fmt.Errorf("policy: rule %d: namespace is required (use \"*\" to match any namespace)", i)
+		}
+		if len(r.Tools) == 0 {
+			return fmt.Errorf("policy: rule %d: tools is required (use [\"*\"] to match any tool)", i)
+		}
+		for _, tool := range r.Tools {
+			if tool == "" {
+				return fmt.Errorf("policy: rule %d: tools contains an empty entry", i)
+			}
+		}
+		if r.Effect != "allow" && r.Effect != "deny" {
+			return fmt.Errorf("policy: rule %d: effect must be \"allow\" or \"deny\", got %q", i, r.Effect)
+		}
 	}
 	return nil
 }
