@@ -164,6 +164,30 @@ type RateLimit struct {
 	Burst             int     `yaml:"burst"`
 }
 
+// Quota configures the gateway-wide per-client sliding-window request
+// quota — a longer-horizon sibling to RateLimit (hours/days rather than
+// per-second). Enabled defaults to false: an absent or disabled `quota:`
+// block means no client is ever quota-limited, today's behavior,
+// unchanged, for any config that doesn't opt in. See internal/quota.
+type Quota struct {
+	Enabled     bool   `yaml:"enabled"`
+	MaxRequests int    `yaml:"max_requests"`
+	Window      string `yaml:"window"`
+}
+
+// WindowDuration parses Window, returning (0, nil) when unset so the
+// caller can distinguish "unset" from "invalid."
+func (q Quota) WindowDuration() (time.Duration, error) {
+	if q.Window == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(q.Window)
+	if err != nil {
+		return 0, fmt.Errorf("invalid quota.window %q: %w", q.Window, err)
+	}
+	return d, nil
+}
+
 // Upstream is one MCP server Portcullis can route to.
 type Upstream struct {
 	Name            string `yaml:"name"`
@@ -221,6 +245,7 @@ type Config struct {
 	Auth        Auth      `yaml:"auth"`
 	Policy      Policy    `yaml:"policy"`
 	RateLimit   RateLimit `yaml:"rate_limit"`
+	Quota       Quota     `yaml:"quota"`
 }
 
 // MaxInflightOrDefault returns MaxInflight, falling back to
@@ -306,6 +331,31 @@ func (c *Config) validate() error {
 	}
 	if err := c.RateLimit.validate(); err != nil {
 		return err
+	}
+	if err := c.Quota.validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (q Quota) validate() error {
+	if q.MaxRequests < 0 {
+		return fmt.Errorf("quota: max_requests must be >= 0, got %d", q.MaxRequests)
+	}
+	d, err := q.WindowDuration()
+	if err != nil {
+		return err
+	}
+	if q.Enabled {
+		if q.MaxRequests <= 0 {
+			return fmt.Errorf("quota: max_requests must be > 0 when quota is enabled")
+		}
+		if q.Window == "" {
+			return fmt.Errorf("quota: window is required when quota is enabled")
+		}
+		if d <= 0 {
+			return fmt.Errorf("quota: window must be > 0 when quota is enabled")
+		}
 	}
 	return nil
 }

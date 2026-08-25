@@ -90,6 +90,13 @@ var (
 		Name: "portcullis_rate_limit_rejected_total",
 		Help: "Total requests rejected because the client exceeded its rate limit.",
 	}, []string{"client"})
+
+	// QuotaRejectedTotal counts requests rejected because a client
+	// exceeded its sliding-window quota.
+	QuotaRejectedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_quota_rejected_total",
+		Help: "Total requests rejected because the client exceeded its quota.",
+	}, []string{"client"})
 )
 
 func init() {
@@ -105,5 +112,6 @@ func init() {
 		AuthRejectedTotal,
 		PolicyDeniedTotal,
 		RateLimitRejectedTotal,
+		QuotaRejectedTotal,
 	)
 }

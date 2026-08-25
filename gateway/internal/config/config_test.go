@@ -342,6 +342,71 @@ func TestConfig_Validate_AcceptsWellFormedRateLimit(t *testing.T) {
 	}
 }
 
+func TestQuota_WindowDuration(t *testing.T) {
+	unset := Quota{}
+	if d, err := unset.WindowDuration(); err != nil || d != 0 {
+		t.Fatalf("expected (0, nil) for unset Window, got (%v, %v)", d, err)
+	}
+
+	set := Quota{Window: "24h"}
+	if d, err := set.WindowDuration(); err != nil || d != 24*time.Hour {
+		t.Fatalf("expected 24h, got (%v, %v)", d, err)
+	}
+
+	bad := Quota{Window: "not-a-duration"}
+	if _, err := bad.WindowDuration(); err == nil {
+		t.Fatal("expected an error for an invalid window")
+	}
+}
+
+func TestConfig_Validate_AcceptsConfigWithNoQuotaBlock(t *testing.T) {
+	// Backward compatibility: an absent `quota:` block means no client is
+	// ever quota-limited, unchanged, for any config that doesn't opt in.
+	if err := validConfig().validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_RejectsNegativeQuotaMaxRequests(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quota.MaxRequests = -1
+	assertValidateError(t, cfg, "max_requests must be >= 0")
+}
+
+func TestConfig_Validate_RejectsInvalidQuotaWindow(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quota.Window = "not-a-duration"
+	assertValidateError(t, cfg, "invalid quota.window")
+}
+
+func TestConfig_Validate_RejectsEnabledQuotaWithNoMaxRequests(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quota = Quota{Enabled: true, Window: "24h"}
+	assertValidateError(t, cfg, "max_requests must be > 0")
+}
+
+func TestConfig_Validate_RejectsEnabledQuotaWithNoWindow(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quota = Quota{Enabled: true, MaxRequests: 1000}
+	assertValidateError(t, cfg, "window is required")
+}
+
+func TestConfig_Validate_AllowsDisabledQuotaWithZeroValues(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quota = Quota{Enabled: false}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AcceptsWellFormedQuota(t *testing.T) {
+	cfg := validConfig()
+	cfg.Quota = Quota{Enabled: true, MaxRequests: 1000, Window: "24h"}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func assertValidateError(t *testing.T, cfg *Config, wantSubstring string) {
 	t.Helper()
 	err := cfg.validate()

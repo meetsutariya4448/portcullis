@@ -19,6 +19,7 @@ import (
 	gwmcp "github.com/meetsutariya4448/portcullis/gateway/internal/mcp"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/policy"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/quota"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/ratelimit"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
@@ -62,6 +63,9 @@ type Options struct {
 	// RateLimiter is optional. nil means no client is ever rate-limited —
 	// today's behavior, unchanged, for a config with no rate_limit: block.
 	RateLimiter *ratelimit.Limiter
+	// QuotaTracker is optional. nil means no client is ever quota-limited
+	// — today's behavior, unchanged, for a config with no quota: block.
+	QuotaTracker *quota.Tracker
 }
 
 // Server holds the dependencies shared by all handlers.
@@ -72,6 +76,7 @@ type Server struct {
 	authenticator *auth.Authenticator
 	policy        *policy.Policy
 	rateLimiter   *ratelimit.Limiter
+	quotaTracker  *quota.Tracker
 
 	// inflightSem bounds total concurrent /mcp handling gateway-wide —
 	// backpressure. A request that can't immediately acquire a slot is
@@ -92,6 +97,7 @@ func New(opts Options) *Server {
 		authenticator: opts.Authenticator,
 		policy:        opts.Policy,
 		rateLimiter:   opts.RateLimiter,
+		quotaTracker:  opts.QuotaTracker,
 		inflightSem:   make(chan struct{}, maxInflight),
 	}
 	s.mux.HandleFunc("POST /mcp", s.handleMCP)
@@ -182,6 +188,12 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		metrics.RateLimitRejectedTotal.WithLabelValues(clientID).Inc()
 		w.Header().Set("Retry-After", "1")
 		s.writeGatewayError(w, r, "", "", http.StatusTooManyRequests, nil, "rate limit exceeded", handlerStart, nil)
+		return
+	}
+
+	if s.quotaTracker != nil && !s.quotaTracker.Allow(clientID) {
+		metrics.QuotaRejectedTotal.WithLabelValues(clientID).Inc()
+		s.writeGatewayError(w, r, "", "", http.StatusTooManyRequests, nil, "quota exceeded", handlerStart, nil)
 		return
 	}
 

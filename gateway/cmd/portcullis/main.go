@@ -16,6 +16,7 @@ import (
 	"github.com/meetsutariya4448/portcullis/gateway/internal/auth"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/config"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/policy"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/quota"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/ratelimit"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/secret"
@@ -50,6 +51,11 @@ func main() {
 
 	pol := buildPolicy(cfg.Policy)
 	limiter := buildRateLimiter(cfg.RateLimit)
+	quotaTracker, err := buildQuotaTracker(cfg.Quota)
+	if err != nil {
+		log.Error("failed to build quota tracker", "error", err)
+		os.Exit(1)
+	}
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -64,6 +70,7 @@ func main() {
 		Authenticator: authenticator,
 		Policy:        pol,
 		RateLimiter:   limiter,
+		QuotaTracker:  quotaTracker,
 	})
 	httpServer := &http.Server{Handler: srv}
 
@@ -75,7 +82,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled, "policy_rules", len(cfg.Policy.Rules), "rate_limit_enabled", cfg.RateLimit.Enabled)
+	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled, "policy_rules", len(cfg.Policy.Rules), "rate_limit_enabled", cfg.RateLimit.Enabled, "quota_enabled", cfg.Quota.Enabled)
 	if err := run(ctx, stop, httpServer, listener, *shutdownTimeout, log); err != nil {
 		os.Exit(1)
 	}
@@ -143,6 +150,20 @@ func buildRateLimiter(cfg config.RateLimit) *ratelimit.Limiter {
 		return nil
 	}
 	return ratelimit.NewLimiter(cfg.RequestsPerSecond, cfg.Burst)
+}
+
+// buildQuotaTracker constructs a quota.Tracker from cfg. Returns (nil,
+// nil) when quota is disabled: the server's quota gate treats a nil
+// Tracker as "off," today's behavior, unchanged.
+func buildQuotaTracker(cfg config.Quota) (*quota.Tracker, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	window, err := cfg.WindowDuration()
+	if err != nil {
+		return nil, err
+	}
+	return quota.NewTracker(window, cfg.MaxRequests), nil
 }
 
 // run serves httpServer on listener until either it exits on its own (an
