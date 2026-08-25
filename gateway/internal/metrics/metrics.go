@@ -26,6 +26,38 @@ var (
 		Name: "portcullis_retry_attempts_total",
 		Help: "Total forward attempts made per upstream, including the first attempt of each request.",
 	}, []string{"upstream"})
+
+	// BulkheadInflight is the current number of in-flight native-path
+	// requests holding a bulkhead slot for an upstream.
+	BulkheadInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "portcullis_bulkhead_inflight",
+		Help: "Current in-flight native-path requests holding a bulkhead slot, per upstream.",
+	}, []string{"upstream"})
+
+	// BulkheadWaitSeconds measures how long a request waited to acquire a
+	// bulkhead slot. Near-zero under normal load; a rising p99 here is the
+	// leading indicator that an upstream's max_concurrent is undersized
+	// (or the upstream itself is slow) before it turns into rejected
+	// requests or gateway-wide backpressure.
+	BulkheadWaitSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "portcullis_bulkhead_wait_seconds",
+		Help:    "Time spent waiting to acquire a per-upstream bulkhead slot.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"upstream"})
+
+	// InflightRequests is the current number of /mcp requests being
+	// handled gateway-wide, gated by the backpressure semaphore.
+	InflightRequests = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "portcullis_inflight_requests",
+		Help: "Current in-flight /mcp requests gateway-wide.",
+	})
+
+	// BackpressureRejectedTotal counts requests rejected with 503 because
+	// the gateway-wide max_inflight bound was already saturated.
+	BackpressureRejectedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "portcullis_backpressure_rejected_total",
+		Help: "Total requests rejected because the gateway-wide inflight bound was saturated.",
+	})
 )
 
 func init() {
@@ -33,5 +65,9 @@ func init() {
 		RequestsTotal,
 		GatewayLatency,
 		RetryAttemptsTotal,
+		BulkheadInflight,
+		BulkheadWaitSeconds,
+		InflightRequests,
+		BackpressureRejectedTotal,
 	)
 }

@@ -13,6 +13,15 @@ import (
 // "timeout" in the config file.
 const defaultUpstreamTimeout = 30 * time.Second
 
+// defaultMaxConcurrent bounds concurrent in-flight requests to an upstream
+// on the native forward path when max_concurrent is unset. Legacy
+// upstreams don't use this — MaxPoolSize already bounds their concurrency.
+const defaultMaxConcurrent = 256
+
+// defaultMaxInflight bounds total concurrent /mcp requests gateway-wide
+// when max_inflight is unset at the top level.
+const defaultMaxInflight = 1000
+
 // RetryPolicy configures per-upstream retry behavior for forward attempts
 // that fail before any side effect could have reached the upstream (see
 // internal/retry's safety boundary, applied at the actual call sites).
@@ -66,8 +75,22 @@ type Upstream struct {
 	// translate.LegacyProtocolVersion). Zero means "use the default." This
 	// exists because the default (8) is sized for production, not for a
 	// benchmark run at 50+ concurrent requests against a single upstream.
-	MaxPoolSize int         `yaml:"max_pool_size"`
-	Retry       RetryPolicy `yaml:"retry"`
+	MaxPoolSize int `yaml:"max_pool_size"`
+	// MaxConcurrent bounds concurrent in-flight requests to this upstream
+	// on the native forward path (bulkhead isolation). Zero means "use
+	// defaultMaxConcurrent." Not consulted for legacy upstreams —
+	// MaxPoolSize already serves this role there.
+	MaxConcurrent int         `yaml:"max_concurrent"`
+	Retry         RetryPolicy `yaml:"retry"`
+}
+
+// MaxConcurrentOrDefault returns MaxConcurrent, falling back to
+// defaultMaxConcurrent when unset.
+func (u Upstream) MaxConcurrentOrDefault() int {
+	if u.MaxConcurrent <= 0 {
+		return defaultMaxConcurrent
+	}
+	return u.MaxConcurrent
 }
 
 // TimeoutDuration returns the parsed per-upstream timeout, falling back to
@@ -87,6 +110,18 @@ func (u Upstream) TimeoutDuration() (time.Duration, error) {
 // proxies to.
 type Config struct {
 	Upstreams []Upstream `yaml:"upstreams"`
+	// MaxInflight bounds total concurrent /mcp requests gateway-wide
+	// (backpressure). Zero means "use defaultMaxInflight."
+	MaxInflight int `yaml:"max_inflight"`
+}
+
+// MaxInflightOrDefault returns MaxInflight, falling back to
+// defaultMaxInflight when unset.
+func (c Config) MaxInflightOrDefault() int {
+	if c.MaxInflight <= 0 {
+		return defaultMaxInflight
+	}
+	return c.MaxInflight
 }
 
 // Load reads and parses the upstream fleet config from path.
@@ -127,6 +162,9 @@ func (c *Config) validate() error {
 		if u.MaxPoolSize < 0 {
 			return fmt.Errorf("upstream %q: max_pool_size must be >= 0, got %d", u.Name, u.MaxPoolSize)
 		}
+		if u.MaxConcurrent < 0 {
+			return fmt.Errorf("upstream %q: max_concurrent must be >= 0, got %d", u.Name, u.MaxConcurrent)
+		}
 		if u.Retry.MaxAttempts < 0 {
 			return fmt.Errorf("upstream %q: retry.max_attempts must be >= 0, got %d", u.Name, u.Retry.MaxAttempts)
 		}
@@ -136,6 +174,9 @@ func (c *Config) validate() error {
 		if _, err := u.Retry.MaxDelayDuration(); err != nil {
 			return fmt.Errorf("upstream %q: %w", u.Name, err)
 		}
+	}
+	if c.MaxInflight < 0 {
+		return fmt.Errorf("max_inflight must be >= 0, got %d", c.MaxInflight)
 	}
 	return nil
 }

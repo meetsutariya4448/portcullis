@@ -35,6 +35,36 @@ func validConfig() *Config {
 	}}
 }
 
+func TestUpstream_MaxConcurrentOrDefault(t *testing.T) {
+	if got := (Upstream{}).MaxConcurrentOrDefault(); got != defaultMaxConcurrent {
+		t.Fatalf("expected default %d, got %d", defaultMaxConcurrent, got)
+	}
+	if got := (Upstream{MaxConcurrent: 10}).MaxConcurrentOrDefault(); got != 10 {
+		t.Fatalf("expected 10, got %d", got)
+	}
+}
+
+func TestConfig_MaxInflightOrDefault(t *testing.T) {
+	if got := (Config{}).MaxInflightOrDefault(); got != defaultMaxInflight {
+		t.Fatalf("expected default %d, got %d", defaultMaxInflight, got)
+	}
+	if got := (Config{MaxInflight: 50}).MaxInflightOrDefault(); got != 50 {
+		t.Fatalf("expected 50, got %d", got)
+	}
+}
+
+func TestConfig_Validate_RejectsNegativeMaxConcurrent(t *testing.T) {
+	cfg := validConfig()
+	cfg.Upstreams[0].MaxConcurrent = -1
+	assertValidateError(t, cfg, "max_concurrent")
+}
+
+func TestConfig_Validate_RejectsNegativeMaxInflight(t *testing.T) {
+	cfg := validConfig()
+	cfg.MaxInflight = -1
+	assertValidateError(t, cfg, "max_inflight")
+}
+
 func TestConfig_Validate_RejectsNegativeRetryMaxAttempts(t *testing.T) {
 	cfg := validConfig()
 	cfg.Upstreams[0].Retry.MaxAttempts = -1

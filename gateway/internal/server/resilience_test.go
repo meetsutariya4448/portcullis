@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -73,7 +75,7 @@ func TestForward_RetriesPreConnectFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
-	gw := New(rtr, log)
+	gw := New(rtr, log, 100)
 
 	before := testutil.ToFloat64(metrics.RetryAttemptsTotal.WithLabelValues("dead-upstream"))
 
@@ -124,7 +126,7 @@ func TestForward_DoesNotRetryPostSendFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
-	gw := New(rtr, log)
+	gw := New(rtr, log, 100)
 
 	rec := httptest.NewRecorder()
 	gw.ServeHTTP(rec, nativeRequest("flaky.echo"))
@@ -134,5 +136,115 @@ func TestForward_DoesNotRetryPostSendFailure(t *testing.T) {
 	}
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestForward_BulkheadBoundsNativeConcurrency proves a per-upstream
+// max_concurrent actually caps how many requests can be in flight to that
+// upstream at once -- the native path had no concurrency ceiling at all
+// before this milestone.
+func TestForward_BulkheadBoundsNativeConcurrency(t *testing.T) {
+	release := make(chan struct{})
+	var concurrent int32
+	var maxSeen int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := atomic.AddInt32(&concurrent, 1)
+		for {
+			m := atomic.LoadInt32(&maxSeen)
+			if c <= m {
+				break
+			}
+			if atomic.CompareAndSwapInt32(&maxSeen, m, c) {
+				break
+			}
+		}
+		<-release
+		atomic.AddInt32(&concurrent, -1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{Upstreams: []config.Upstream{{
+		Name: "slow-upstream", Namespace: "slow", URL: srv.URL, MaxConcurrent: 2,
+	}}}
+	log := discardLogger()
+	rtr, err := router.New(cfg, log)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	gw := New(rtr, log, 100)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			gw.ServeHTTP(rec, nativeRequest("slow.echo"))
+		}()
+	}
+
+	time.Sleep(150 * time.Millisecond) // let the requests pile up against the bulkhead
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&maxSeen); got > 2 {
+		t.Fatalf("expected the bulkhead to cap concurrency at 2, observed %d simultaneous requests", got)
+	}
+}
+
+// TestHandleMCP_BackpressureRejectsWhenSaturated proves the gateway-wide
+// inflight bound rejects excess load with 503 + Retry-After immediately,
+// rather than letting requests queue unboundedly.
+func TestHandleMCP_BackpressureRejectsWhenSaturated(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{Upstreams: []config.Upstream{{
+		Name: "bp-upstream", Namespace: "bp", URL: srv.URL, MaxConcurrent: 100,
+	}}}
+	log := discardLogger()
+	rtr, err := router.New(cfg, log)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	gw := New(rtr, log, 2) // gateway-wide max_inflight = 2
+
+	var wg sync.WaitGroup
+	codes := make([]int, 3)
+	var retryAfterSeen int32
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			gw.ServeHTTP(rec, nativeRequest("bp.echo"))
+			codes[i] = rec.Code
+			if rec.Code == http.StatusServiceUnavailable && rec.Header().Get("Retry-After") != "" {
+				atomic.AddInt32(&retryAfterSeen, 1)
+			}
+		}(i)
+	}
+
+	time.Sleep(150 * time.Millisecond) // let the 3 requests all attempt admission
+	close(release)
+	wg.Wait()
+
+	var rejected int
+	for _, c := range codes {
+		if c == http.StatusServiceUnavailable {
+			rejected++
+		}
+	}
+	if rejected != 1 {
+		t.Fatalf("expected exactly 1 of 3 requests rejected with max_inflight=2, got %d (codes: %v)", rejected, codes)
+	}
+	if atomic.LoadInt32(&retryAfterSeen) != 1 {
+		t.Fatal("expected the rejected request to carry a Retry-After header")
 	}
 }

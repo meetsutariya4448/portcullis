@@ -122,7 +122,7 @@ func TestHandleMCP_LegacyUpstream_ClientNeverHandlesSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router.New failed: %v", err)
 	}
-	gw := New(rtr, log)
+	gw := New(rtr, log, 100)
 
 	clientBody := `{
 		"jsonrpc": "2.0",

@@ -31,9 +31,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := server.New(rtr, log)
+	srv := server.New(rtr, log, cfg.MaxInflightOrDefault())
 
-	log.Info("portcullis starting", "addr", *addr, "upstreams", len(cfg.Upstreams))
+	log.Info("portcullis starting", "addr", *addr, "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault())
 	if err := http.ListenAndServe(*addr, srv); err != nil {
 		log.Error("server exited", "error", err)
 		os.Exit(1)

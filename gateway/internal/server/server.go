@@ -39,11 +39,20 @@ type Server struct {
 	router *router.Router
 	log    *slog.Logger
 	mux    *http.ServeMux
+
+	// inflightSem bounds total concurrent /mcp handling gateway-wide —
+	// backpressure. A request that can't immediately acquire a slot is
+	// rejected with 503 + Retry-After rather than queuing unboundedly.
+	inflightSem chan struct{}
 }
 
-// New builds a Server and registers its routes.
-func New(rtr *router.Router, log *slog.Logger) *Server {
-	s := &Server{router: rtr, log: log, mux: http.NewServeMux()}
+// New builds a Server and registers its routes. maxInflight bounds total
+// concurrent /mcp requests gateway-wide; pass config.MaxInflightOrDefault().
+func New(rtr *router.Router, log *slog.Logger, maxInflight int) *Server {
+	if maxInflight <= 0 {
+		maxInflight = 1
+	}
+	s := &Server{router: rtr, log: log, mux: http.NewServeMux(), inflightSem: make(chan struct{}, maxInflight)}
 	s.mux.HandleFunc("POST /mcp", s.handleMCP)
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.Handle("GET /metrics", promhttp.Handler())
@@ -64,6 +73,20 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // forward the request unchanged, and return the response unchanged.
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	handlerStart := time.Now()
+
+	select {
+	case s.inflightSem <- struct{}{}:
+	default:
+		metrics.BackpressureRejectedTotal.Inc()
+		w.Header().Set("Retry-After", "1")
+		s.writeGatewayError(w, r, "", "", http.StatusServiceUnavailable, nil, "gateway at capacity, try again shortly", handlerStart, nil)
+		return
+	}
+	metrics.InflightRequests.Inc()
+	defer func() {
+		metrics.InflightRequests.Dec()
+		<-s.inflightSem
+	}()
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -164,14 +187,26 @@ func (s *Server) forward(ctx context.Context, upstream *router.Upstream, body []
 	return resp, err
 }
 
-// forwardNative sends body directly to a native (2026-07-28) upstream. A
-// failure before the request reached the upstream (a pre-connect dial
+// forwardNative sends body directly to a native (2026-07-28) upstream,
+// guarded by that upstream's bulkhead. A failure before the request
+// reached the upstream (bulkhead wait canceled, a pre-connect dial
 // failure) is returned bare so retry.Do may retry it; anything after the
 // request was handed to the upstream is wrapped in retry.NonRetryable --
 // MCP tool calls are not guaranteed idempotent, so a failure that might
 // mean the upstream already started processing the call must never be
 // retried automatically.
 func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, body []byte, headers http.Header) (*http.Response, error) {
+	waitStart := time.Now()
+	if err := upstream.Bulkhead.Acquire(ctx); err != nil {
+		return nil, retry.NonRetryable(err)
+	}
+	metrics.BulkheadWaitSeconds.WithLabelValues(upstream.Name).Observe(time.Since(waitStart).Seconds())
+	metrics.BulkheadInflight.WithLabelValues(upstream.Name).Inc()
+	defer func() {
+		metrics.BulkheadInflight.WithLabelValues(upstream.Name).Dec()
+		upstream.Bulkhead.Release()
+	}()
+
 	probeCtx, connEstablished := retry.WithConnProbe(ctx)
 	outReq, err := http.NewRequestWithContext(probeCtx, http.MethodPost, upstream.URL, bytes.NewReader(body))
 	if err != nil {
@@ -257,9 +292,9 @@ func translateForwardError(err error) (httpStatus int, message string) {
 	case errors.Is(err, translate.ErrPoolExhausted):
 		return http.StatusServiceUnavailable, "legacy session pool exhausted"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-		// Most commonly a request whose retry budget ran out while waiting
-		// on a backoff delay, or the client itself disconnecting mid-request.
-		return http.StatusServiceUnavailable, "request canceled or timed out while retrying"
+		// A request whose context ended while waiting -- on a retry backoff
+		// delay, on a bulkhead slot, or the client disconnecting mid-request.
+		return http.StatusServiceUnavailable, "request canceled or timed out waiting for upstream capacity"
 	default:
 		return http.StatusBadGateway, "upstream request failed"
 	}

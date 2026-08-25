@@ -26,6 +26,13 @@ const maxIdleConnsPerUpstream = 32
 // LegacyPool is non-nil only when ProtocolVersion is translate.LegacyProtocolVersion
 // (2025-11-25): requests to that upstream go through the session-pool shim
 // in package translate instead of Client directly.
+//
+// Bulkhead protects the NATIVE forward path (server.go acquires/releases
+// it around upstream.Client.Do). Legacy upstreams keep using LegacyPool's
+// own MaxPoolSize-bounded concurrency instead — Bulkhead is still
+// constructed for a legacy Upstream (so the zero value is never nil) but
+// the server never exercises it on that path, since forwarding always
+// goes through LegacyPool.Forward.
 type Upstream struct {
 	Name            string
 	Namespace       string
@@ -33,6 +40,7 @@ type Upstream struct {
 	ProtocolVersion string
 	Client          *http.Client
 	LegacyPool      *translate.Pool
+	Bulkhead        bulkhead
 	RetryConfig     retry.Config
 }
 
@@ -42,9 +50,10 @@ type Router struct {
 }
 
 // New builds a Router from the loaded config, constructing one pooled
-// *http.Client per upstream, and — for upstreams declaring
-// protocol_version: "2025-11-25" — a translate.Pool that performs the
-// legacy handshake and holds sessions on the client's behalf.
+// *http.Client and a bulkhead per upstream (see the Upstream doc comment
+// for which path actually uses the bulkhead), and — for upstreams
+// declaring protocol_version: "2025-11-25" — a translate.Pool that
+// performs the legacy handshake and holds sessions on the client's behalf.
 func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 	upstreams := make(map[string]*Upstream, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
@@ -77,6 +86,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 			URL:             u.URL,
 			ProtocolVersion: u.ProtocolVersion,
 			Client:          client,
+			Bulkhead:        newBulkhead(u.MaxConcurrentOrDefault()),
 			RetryConfig:     retryCfg,
 		}
 		if u.ProtocolVersion == translate.LegacyProtocolVersion {
