@@ -4,6 +4,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	gwmcp "github.com/meetsutariya4448/portcullis/gateway/internal/mcp"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/translate"
 )
@@ -103,17 +105,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	preUpstream := time.Since(handlerStart)
 
 	upstreamStart := time.Now()
-	var resp *http.Response
-	if upstream.LegacyPool != nil {
-		resp, err = upstream.LegacyPool.Forward(r.Context(), body)
-	} else {
-		var outReq *http.Request
-		outReq, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.URL, bytes.NewReader(body))
-		if err == nil {
-			copyHeaders(outReq.Header, r.Header)
-			resp, err = upstream.Client.Do(outReq)
-		}
-	}
+	resp, err := s.forward(r.Context(), upstream, body, r.Header)
 	upstreamDuration := time.Since(upstreamStart)
 	if err != nil {
 		httpStatus, message := translateForwardError(err)
@@ -147,6 +139,56 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("mcp request", logArgs...)
+}
+
+// forward dispatches to the legacy or native forward path and wraps the
+// whole attempt in upstream's retry policy. retry.Do re-invokes fn from
+// scratch on a retryable failure — for the legacy path that means a fresh
+// Pool.Forward call (which itself starts with a fresh session lease); for
+// the native path, forwardNative re-dials from scratch. Neither path
+// decides retryability once up front — each attempt's own outcome decides
+// whether the next attempt happens.
+func (s *Server) forward(ctx context.Context, upstream *router.Upstream, body []byte, headers http.Header) (*http.Response, error) {
+	var resp *http.Response
+	err := retry.Do(ctx, upstream.RetryConfig, func(attempt int) error {
+		metrics.RetryAttemptsTotal.WithLabelValues(upstream.Name).Inc()
+
+		var attemptErr error
+		if upstream.LegacyPool != nil {
+			resp, attemptErr = upstream.LegacyPool.Forward(ctx, body)
+		} else {
+			resp, attemptErr = s.forwardNative(ctx, upstream, body, headers)
+		}
+		return attemptErr
+	})
+	return resp, err
+}
+
+// forwardNative sends body directly to a native (2026-07-28) upstream. A
+// failure before the request reached the upstream (a pre-connect dial
+// failure) is returned bare so retry.Do may retry it; anything after the
+// request was handed to the upstream is wrapped in retry.NonRetryable --
+// MCP tool calls are not guaranteed idempotent, so a failure that might
+// mean the upstream already started processing the call must never be
+// retried automatically.
+func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, body []byte, headers http.Header) (*http.Response, error) {
+	probeCtx, connEstablished := retry.WithConnProbe(ctx)
+	outReq, err := http.NewRequestWithContext(probeCtx, http.MethodPost, upstream.URL, bytes.NewReader(body))
+	if err != nil {
+		return nil, retry.NonRetryable(err)
+	}
+	copyHeaders(outReq.Header, headers)
+
+	resp, err := upstream.Client.Do(outReq)
+	if err != nil {
+		if connEstablished() {
+			// The request reached the upstream (or we can't prove it
+			// didn't) -- not safe to retry automatically.
+			return nil, retry.NonRetryable(err)
+		}
+		return nil, err // pre-connect failure: safe to retry
+	}
+	return resp, nil
 }
 
 // writeJSONRPCError writes a fully-formed JSON-RPC error response (e.g. a
@@ -214,6 +256,10 @@ func translateForwardError(err error) (httpStatus int, message string) {
 		return http.StatusServiceUnavailable, "upstream circuit breaker is open"
 	case errors.Is(err, translate.ErrPoolExhausted):
 		return http.StatusServiceUnavailable, "legacy session pool exhausted"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		// Most commonly a request whose retry budget ran out while waiting
+		// on a backoff delay, or the client itself disconnecting mid-request.
+		return http.StatusServiceUnavailable, "request canceled or timed out while retrying"
 	default:
 		return http.StatusBadGateway, "upstream request failed"
 	}

@@ -5,11 +5,13 @@ package router
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/meetsutariya4448/portcullis/gateway/internal/config"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/translate"
 )
 
@@ -31,6 +33,7 @@ type Upstream struct {
 	ProtocolVersion string
 	Client          *http.Client
 	LegacyPool      *translate.Pool
+	RetryConfig     retry.Config
 }
 
 // Router maps a tool/resource/prompt namespace to its upstream.
@@ -49,11 +52,23 @@ func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 		if err != nil {
 			return nil, err
 		}
+		retryCfg, err := retryConfigFrom(u.Retry)
+		if err != nil {
+			return nil, err
+		}
+
 		client := &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
 				MaxIdleConnsPerHost: maxIdleConnsPerUpstream,
 				IdleConnTimeout:     90 * time.Second,
+				// Wraps the same dialer net/http would use by default
+				// (DialContext left nil) — behavior is unchanged, but now
+				// a successful dial is observable via retry.WithConnProbe,
+				// which is what lets the native forward path retry a
+				// pre-connect failure while never retrying a request that
+				// actually reached the upstream.
+				DialContext: retry.ProbeDialContext((&net.Dialer{}).DialContext),
 			},
 		}
 		upstream := &Upstream{
@@ -62,6 +77,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 			URL:             u.URL,
 			ProtocolVersion: u.ProtocolVersion,
 			Client:          client,
+			RetryConfig:     retryCfg,
 		}
 		if u.ProtocolVersion == translate.LegacyProtocolVersion {
 			upstream.LegacyPool = translate.NewPool(u.URL, client, log, u.MaxPoolSize)
@@ -69,6 +85,26 @@ func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 		upstreams[u.Namespace] = upstream
 	}
 	return &Router{upstreams: upstreams}, nil
+}
+
+// retryConfigFrom converts a config.RetryPolicy (string durations,
+// YAML-facing) into a retry.Config (parsed durations). config.Config.validate
+// already checked these parse cleanly at load time; errors here would only
+// occur if New is called with a config that skipped validation.
+func retryConfigFrom(p config.RetryPolicy) (retry.Config, error) {
+	baseDelay, err := p.BaseDelayDuration()
+	if err != nil {
+		return retry.Config{}, err
+	}
+	maxDelay, err := p.MaxDelayDuration()
+	if err != nil {
+		return retry.Config{}, err
+	}
+	return retry.Config{
+		MaxAttempts: p.MaxAttempts,
+		BaseDelay:   baseDelay,
+		MaxDelay:    maxDelay,
+	}, nil
 }
 
 // SplitName splits a "{namespace}.{tool}" name into its namespace and tool

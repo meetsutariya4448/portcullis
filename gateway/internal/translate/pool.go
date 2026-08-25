@@ -25,6 +25,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
 )
 
 // DefaultMaxPoolSize bounds how many concurrent legacy sessions Portcullis
@@ -74,6 +76,14 @@ func NewPool(url string, client *http.Client, log *slog.Logger, maxSize int) *Po
 // exhaustion is deliberately excluded from breaker accounting — it's a
 // capacity signal about Portcullis's own bound, not evidence the upstream
 // is unhealthy.
+//
+// Retry safety boundary: a caller may wrap the whole Forward call in
+// retry.Do. Failures during lease() (pool exhaustion, handshake failure)
+// are returned bare (retryable) — nothing has reached the upstream's tool
+// yet, so a fresh Forward attempt just tries lease() again. Everything
+// after a session is successfully leased is wrapped in retry.NonRetryable:
+// the tool-call request may have reached (or been partially processed by)
+// the upstream, and MCP tool calls are not guaranteed idempotent.
 func (p *Pool) Forward(ctx context.Context, body []byte) (*http.Response, error) {
 	if !p.breaker.Allow() {
 		return nil, ErrCircuitOpen
@@ -91,7 +101,7 @@ func (p *Pool) Forward(ctx context.Context, body []byte) (*http.Response, error)
 	if err != nil {
 		p.breaker.Record(false)
 		p.discardSession()
-		return nil, fmt.Errorf("building legacy request: %w", err)
+		return nil, retry.NonRetryable(fmt.Errorf("building legacy request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
@@ -101,7 +111,7 @@ func (p *Pool) Forward(ctx context.Context, body []byte) (*http.Response, error)
 	if err != nil {
 		p.breaker.Record(false)
 		p.discardSession()
-		return nil, fmt.Errorf("legacy upstream request failed: %w", err)
+		return nil, retry.NonRetryable(fmt.Errorf("legacy upstream request failed: %w", err))
 	}
 
 	unsupported, buffered, err := sniffUnsupportedMRTR(resp)
@@ -109,7 +119,7 @@ func (p *Pool) Forward(ctx context.Context, body []byte) (*http.Response, error)
 		resp.Body.Close()
 		p.breaker.Record(false)
 		p.discardSession()
-		return nil, fmt.Errorf("reading legacy response: %w", err)
+		return nil, retry.NonRetryable(fmt.Errorf("reading legacy response: %w", err))
 	}
 	if unsupported {
 		resp.Body.Close()
@@ -120,7 +130,7 @@ func (p *Pool) Forward(ctx context.Context, body []byte) (*http.Response, error)
 		p.returnSession(sess)
 		p.log.Error("translate: legacy upstream sent an unsupported multi-round-trip request",
 			"upstream", p.url, "session_id", sess.ID)
-		return nil, ErrUnsupportedMRTR
+		return nil, retry.NonRetryable(ErrUnsupportedMRTR)
 	}
 
 	p.breaker.Record(true)

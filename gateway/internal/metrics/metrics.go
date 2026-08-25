@@ -18,8 +18,20 @@ var (
 		Help:    "Gateway-only overhead per request, excluding upstream round-trip time.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"method", "tool", "status"})
+
+	// RetryAttemptsTotal counts every forward attempt made (including the
+	// first), per upstream. attempts_total minus RequestsTotal's request
+	// count for the same upstream is how many extra attempts retries cost.
+	RetryAttemptsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_retry_attempts_total",
+		Help: "Total forward attempts made per upstream, including the first attempt of each request.",
+	}, []string{"upstream"})
 )
 
 func init() {
-	prometheus.MustRegister(RequestsTotal, GatewayLatency)
+	prometheus.MustRegister(
+		RequestsTotal,
+		GatewayLatency,
+		RetryAttemptsTotal,
+	)
 }

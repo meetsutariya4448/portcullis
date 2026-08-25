@@ -13,6 +13,44 @@ import (
 // "timeout" in the config file.
 const defaultUpstreamTimeout = 30 * time.Second
 
+// RetryPolicy configures per-upstream retry behavior for forward attempts
+// that fail before any side effect could have reached the upstream (see
+// internal/retry's safety boundary, applied at the actual call sites).
+// The zero value means "use internal/retry.DefaultConfig" for every field;
+// an explicit MaxAttempts of 1 disables retries for an upstream an
+// operator knows is unsafe to retry.
+type RetryPolicy struct {
+	MaxAttempts int    `yaml:"max_attempts"`
+	BaseDelay   string `yaml:"base_delay"`
+	MaxDelay    string `yaml:"max_delay"`
+}
+
+// BaseDelayDuration parses BaseDelay, returning (0, nil) when unset so the
+// caller can substitute its own default.
+func (r RetryPolicy) BaseDelayDuration() (time.Duration, error) {
+	if r.BaseDelay == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(r.BaseDelay)
+	if err != nil {
+		return 0, fmt.Errorf("invalid retry.base_delay %q: %w", r.BaseDelay, err)
+	}
+	return d, nil
+}
+
+// MaxDelayDuration parses MaxDelay, returning (0, nil) when unset so the
+// caller can substitute its own default.
+func (r RetryPolicy) MaxDelayDuration() (time.Duration, error) {
+	if r.MaxDelay == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(r.MaxDelay)
+	if err != nil {
+		return 0, fmt.Errorf("invalid retry.max_delay %q: %w", r.MaxDelay, err)
+	}
+	return d, nil
+}
+
 // Upstream is one MCP server Portcullis can route to.
 type Upstream struct {
 	Name            string `yaml:"name"`
@@ -28,7 +66,8 @@ type Upstream struct {
 	// translate.LegacyProtocolVersion). Zero means "use the default." This
 	// exists because the default (8) is sized for production, not for a
 	// benchmark run at 50+ concurrent requests against a single upstream.
-	MaxPoolSize int `yaml:"max_pool_size"`
+	MaxPoolSize int         `yaml:"max_pool_size"`
+	Retry       RetryPolicy `yaml:"retry"`
 }
 
 // TimeoutDuration returns the parsed per-upstream timeout, falling back to
@@ -87,6 +126,15 @@ func (c *Config) validate() error {
 		}
 		if u.MaxPoolSize < 0 {
 			return fmt.Errorf("upstream %q: max_pool_size must be >= 0, got %d", u.Name, u.MaxPoolSize)
+		}
+		if u.Retry.MaxAttempts < 0 {
+			return fmt.Errorf("upstream %q: retry.max_attempts must be >= 0, got %d", u.Name, u.Retry.MaxAttempts)
+		}
+		if _, err := u.Retry.BaseDelayDuration(); err != nil {
+			return fmt.Errorf("upstream %q: %w", u.Name, err)
+		}
+		if _, err := u.Retry.MaxDelayDuration(); err != nil {
+			return fmt.Errorf("upstream %q: %w", u.Name, err)
 		}
 	}
 	return nil
