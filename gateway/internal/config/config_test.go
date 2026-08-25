@@ -158,6 +158,94 @@ func TestConfig_Validate_RejectsInvalidBreakerCooldown(t *testing.T) {
 	assertValidateError(t, cfg, "cooldown")
 }
 
+func TestAuthClient_ExpiresAtTime(t *testing.T) {
+	unset := AuthClient{ClientID: "x"}
+	got, err := unset.ExpiresAtTime()
+	if err != nil || got != nil {
+		t.Fatalf("expected (nil, nil) for unset ExpiresAt, got (%v, %v)", got, err)
+	}
+
+	set := AuthClient{ClientID: "x", ExpiresAt: "2027-01-01T00:00:00Z"}
+	got, err = set.ExpiresAtTime()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil || got.Year() != 2027 {
+		t.Fatalf("expected a parsed 2027 timestamp, got %v", got)
+	}
+
+	bad := AuthClient{ClientID: "x", ExpiresAt: "not-a-timestamp"}
+	if _, err := bad.ExpiresAtTime(); err == nil {
+		t.Fatal("expected an error for an invalid expires_at")
+	}
+}
+
+func TestConfig_Validate_AcceptsConfigWithNoAuthBlock(t *testing.T) {
+	// Backward compatibility: existing configs with no `auth:` block at
+	// all must keep validating and behaving exactly as before this
+	// milestone.
+	if err := validConfig().validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_RejectsAuthClientWithNoID(t *testing.T) {
+	cfg := validConfig()
+	cfg.Auth.Clients = []AuthClient{{APIKeys: []string{"key1"}}}
+	assertValidateError(t, cfg, "client_id")
+}
+
+func TestConfig_Validate_RejectsDuplicateClientID(t *testing.T) {
+	cfg := validConfig()
+	cfg.Auth.Clients = []AuthClient{
+		{ClientID: "acme", APIKeys: []string{"key1"}},
+		{ClientID: "acme", APIKeys: []string{"key2"}},
+	}
+	assertValidateError(t, cfg, "duplicate client_id")
+}
+
+func TestConfig_Validate_RejectsEnabledClientWithNoKeys(t *testing.T) {
+	cfg := validConfig()
+	cfg.Auth.Enabled = true
+	cfg.Auth.Clients = []AuthClient{{ClientID: "acme"}}
+	assertValidateError(t, cfg, "no api_keys")
+}
+
+func TestConfig_Validate_AllowsDisabledClientWithNoKeys(t *testing.T) {
+	// A client entry can exist in config (e.g. staged ahead of enabling
+	// auth) without keys as long as auth isn't actually enabled yet.
+	cfg := validConfig()
+	cfg.Auth.Enabled = false
+	cfg.Auth.Clients = []AuthClient{{ClientID: "acme"}}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_RejectsDuplicateAPIKeyAcrossClients(t *testing.T) {
+	cfg := validConfig()
+	cfg.Auth.Clients = []AuthClient{
+		{ClientID: "acme", APIKeys: []string{"shared-key"}},
+		{ClientID: "globex", APIKeys: []string{"shared-key"}},
+	}
+	assertValidateError(t, cfg, "reused")
+}
+
+func TestConfig_Validate_RejectsInvalidExpiresAt(t *testing.T) {
+	cfg := validConfig()
+	cfg.Auth.Clients = []AuthClient{{ClientID: "acme", APIKeys: []string{"key1"}, ExpiresAt: "not-a-timestamp"}}
+	assertValidateError(t, cfg, "expires_at")
+}
+
+func TestConfig_Validate_AcceptsKeyRotationTwoKeysSameClient(t *testing.T) {
+	cfg := validConfig()
+	cfg.Auth.Enabled = true
+	cfg.Auth.Clients = []AuthClient{{ClientID: "acme", APIKeys: []string{"old-key", "new-key"}}}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func assertValidateError(t *testing.T, cfg *Config, wantSubstring string) {
 	t.Helper()
 	err := cfg.validate()

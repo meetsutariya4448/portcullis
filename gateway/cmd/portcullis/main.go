@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -12,8 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meetsutariya4448/portcullis/gateway/internal/auth"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/config"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/router"
+	"github.com/meetsutariya4448/portcullis/gateway/internal/secret"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/server"
 )
 
@@ -37,13 +40,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	authenticator, err := buildAuthenticator(cfg.Auth)
+	if err != nil {
+		log.Error("failed to build authenticator", "error", err)
+		os.Exit(1)
+	}
+
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Error("failed to bind", "addr", *addr, "error", err)
 		os.Exit(1)
 	}
 
-	srv := server.New(rtr, log, cfg.MaxInflightOrDefault())
+	srv := server.New(server.Options{
+		Router:        rtr,
+		Log:           log,
+		MaxInflight:   cfg.MaxInflightOrDefault(),
+		Authenticator: authenticator,
+	})
 	httpServer := &http.Server{Handler: srv}
 
 	// First SIGINT/SIGTERM triggers a graceful drain (in run, below);
@@ -54,10 +68,46 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault())
+	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled)
 	if err := run(ctx, stop, httpServer, listener, *shutdownTimeout, log); err != nil {
 		os.Exit(1)
 	}
+}
+
+// buildAuthenticator constructs an auth.Authenticator from cfg, expanding
+// each configured API key through secret.Expand (env-var-backed by
+// default — see internal/secret) so keys don't have to sit in plaintext
+// YAML; a value with no "${SECRET:...}" wrapper passes through as a
+// literal, so local-dev configs work without a real provider. Returns
+// (nil, nil) when auth is disabled: the server's auth gate treats a nil
+// Authenticator as "authentication off," today's behavior, unchanged.
+func buildAuthenticator(cfg config.Auth) (*auth.Authenticator, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	provider := secret.EnvProvider{}
+	clients := make([]auth.Client, 0, len(cfg.Clients))
+	for _, c := range cfg.Clients {
+		keys := make([]string, 0, len(c.APIKeys))
+		for _, k := range c.APIKeys {
+			resolved, err := secret.Expand(k, provider)
+			if err != nil {
+				return nil, fmt.Errorf("client %q: resolving api key: %w", c.ClientID, err)
+			}
+			keys = append(keys, resolved)
+		}
+		expiresAt, err := c.ExpiresAtTime()
+		if err != nil {
+			return nil, err
+		}
+		clients = append(clients, auth.Client{
+			ID:        c.ClientID,
+			APIKeys:   keys,
+			ExpiresAt: expiresAt,
+			Revoked:   c.Revoked,
+		})
+	}
+	return auth.New(clients), nil
 }
 
 // run serves httpServer on listener until either it exits on its own (an

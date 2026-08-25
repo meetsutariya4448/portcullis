@@ -68,6 +68,13 @@ var (
 		Name: "portcullis_backpressure_rejected_total",
 		Help: "Total requests rejected because the gateway-wide inflight bound was saturated.",
 	})
+
+	// AuthRejectedTotal counts requests rejected at the gateway-edge
+	// authentication gate, by reason (missing/invalid/revoked/expired).
+	AuthRejectedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_auth_rejected_total",
+		Help: "Total requests rejected by gateway-edge authentication, by reason.",
+	}, []string{"reason"})
 )
 
 func init() {
@@ -80,5 +87,6 @@ func init() {
 		BulkheadWaitSeconds,
 		InflightRequests,
 		BackpressureRejectedTotal,
+		AuthRejectedTotal,
 	)
 }

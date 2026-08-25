@@ -75,7 +75,7 @@ func TestForward_RetriesPreConnectFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
-	gw := New(rtr, log, 100)
+	gw := New(Options{Router: rtr, Log: log, MaxInflight: 100})
 
 	before := testutil.ToFloat64(metrics.RetryAttemptsTotal.WithLabelValues("dead-upstream"))
 
@@ -126,7 +126,7 @@ func TestForward_DoesNotRetryPostSendFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
-	gw := New(rtr, log, 100)
+	gw := New(Options{Router: rtr, Log: log, MaxInflight: 100})
 
 	rec := httptest.NewRecorder()
 	gw.ServeHTTP(rec, nativeRequest("flaky.echo"))
@@ -165,7 +165,7 @@ func TestForward_NativeBreakerOpensAfterRepeatedFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
-	gw := New(rtr, log, 100)
+	gw := New(Options{Router: rtr, Log: log, MaxInflight: 100})
 
 	// Trip the breaker: minSamples=2 failing requests at 100% error rate.
 	for i := 0; i < 2; i++ {
@@ -220,7 +220,7 @@ func TestForward_BulkheadBoundsNativeConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
-	gw := New(rtr, log, 100)
+	gw := New(Options{Router: rtr, Log: log, MaxInflight: 100})
 
 	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
@@ -260,7 +260,7 @@ func TestHandleMCP_BackpressureRejectsWhenSaturated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
-	gw := New(rtr, log, 2) // gateway-wide max_inflight = 2
+	gw := New(Options{Router: rtr, Log: log, MaxInflight: 2}) // gateway-wide max_inflight = 2
 
 	var wg sync.WaitGroup
 	codes := make([]int, 3)

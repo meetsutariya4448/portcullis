@@ -15,6 +15,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/meetsutariya4448/portcullis/gateway/internal/auth"
 	gwmcp "github.com/meetsutariya4448/portcullis/gateway/internal/mcp"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
@@ -26,6 +27,12 @@ import (
 // memory before rejecting the request.
 const maxBodyBytes = 10 << 20 // 10MiB
 
+// apiKeyHeader carries the gateway-edge API key. Deliberately not
+// "Authorization": that header (if a client sends one) is meant for the
+// upstream MCP server and is forwarded through unchanged by copyHeaders —
+// Portcullis's own auth needs a header of its own so the two never collide.
+const apiKeyHeader = "X-Portcullis-Api-Key"
+
 // hopByHopHeaders are stripped when forwarding a request or response, per
 // RFC 9110's hop-by-hop header list — they describe this specific
 // connection, not the message, and must not be blindly relayed.
@@ -34,11 +41,26 @@ var hopByHopHeaders = []string{
 	"TE", "Trailer", "Transfer-Encoding", "Upgrade",
 }
 
+// Options bundles Server's dependencies. Introduced in Milestone 2 instead
+// of growing New's positional parameter list further (it was already at
+// 3 after Milestone 1); more traffic-control dependencies land here as
+// later Milestone 2 commits add them.
+type Options struct {
+	Router      *router.Router
+	Log         *slog.Logger
+	MaxInflight int
+	// Authenticator is optional. nil means gateway-edge authentication is
+	// disabled and every request is allowed through unauthenticated —
+	// today's behavior, unchanged, for a config with no auth: block.
+	Authenticator *auth.Authenticator
+}
+
 // Server holds the dependencies shared by all handlers.
 type Server struct {
-	router *router.Router
-	log    *slog.Logger
-	mux    *http.ServeMux
+	router        *router.Router
+	log           *slog.Logger
+	mux           *http.ServeMux
+	authenticator *auth.Authenticator
 
 	// inflightSem bounds total concurrent /mcp handling gateway-wide —
 	// backpressure. A request that can't immediately acquire a slot is
@@ -46,13 +68,19 @@ type Server struct {
 	inflightSem chan struct{}
 }
 
-// New builds a Server and registers its routes. maxInflight bounds total
-// concurrent /mcp requests gateway-wide; pass config.MaxInflightOrDefault().
-func New(rtr *router.Router, log *slog.Logger, maxInflight int) *Server {
+// New builds a Server and registers its routes.
+func New(opts Options) *Server {
+	maxInflight := opts.MaxInflight
 	if maxInflight <= 0 {
 		maxInflight = 1
 	}
-	s := &Server{router: rtr, log: log, mux: http.NewServeMux(), inflightSem: make(chan struct{}, maxInflight)}
+	s := &Server{
+		router:        opts.Router,
+		log:           opts.Log,
+		mux:           http.NewServeMux(),
+		authenticator: opts.Authenticator,
+		inflightSem:   make(chan struct{}, maxInflight),
+	}
 	s.mux.HandleFunc("POST /mcp", s.handleMCP)
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.Handle("GET /metrics", promhttp.Handler())
@@ -66,6 +94,38 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
+}
+
+// authenticate resolves the caller's identity from the apiKeyHeader. When
+// no Authenticator is configured (auth disabled, or no auth: block in
+// config at all), every request is allowed through with an empty
+// clientID — today's behavior, unchanged.
+func (s *Server) authenticate(r *http.Request) (clientID string, err error) {
+	if s.authenticator == nil {
+		return "", nil
+	}
+	client, err := s.authenticator.Authenticate(r.Header.Get(apiKeyHeader))
+	if err != nil {
+		return "", err
+	}
+	return client.ID, nil
+}
+
+// authRejectReason maps an auth error to a stable, low-cardinality metric
+// label.
+func authRejectReason(err error) string {
+	switch {
+	case errors.Is(err, auth.ErrMissingKey):
+		return "missing"
+	case errors.Is(err, auth.ErrInvalidKey):
+		return "invalid"
+	case errors.Is(err, auth.ErrRevoked):
+		return "revoked"
+	case errors.Is(err, auth.ErrExpired):
+		return "expired"
+	default:
+		return "unknown"
+	}
 }
 
 // handleMCP is the single stateless data-plane endpoint: validate headers
@@ -87,6 +147,13 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		metrics.InflightRequests.Dec()
 		<-s.inflightSem
 	}()
+
+	clientID, err := s.authenticate(r)
+	if err != nil {
+		metrics.AuthRejectedTotal.WithLabelValues(authRejectReason(err)).Inc()
+		s.writeGatewayError(w, r, "", "", http.StatusUnauthorized, nil, err.Error(), handlerStart, err)
+		return
+	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -153,6 +220,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		"method", req.Method,
 		"tool", headers.Name,
 		"upstream", upstream.Name,
+		"client", clientID,
 		"duration_ms", totalDuration.Milliseconds(),
 		"status", resp.StatusCode,
 		"upstream_duration_ms", upstreamDuration.Milliseconds(),

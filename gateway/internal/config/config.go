@@ -95,6 +95,43 @@ func (c CircuitBreakerPolicy) CooldownDuration() (time.Duration, error) {
 	return d, nil
 }
 
+// AuthClient is one caller Portcullis recognizes: a client identity plus
+// the API key(s) that authenticate as it. APIKeys is a list deliberately
+// — key rotation is just "list the old and new key together for a
+// while," no separate rotation mechanism needed. Each entry in APIKeys
+// may be a literal or a "${SECRET:NAME}" reference (see
+// internal/secret) — expansion happens where the Authenticator is built,
+// not here, so this package stays free of a dependency on internal/secret.
+type AuthClient struct {
+	ClientID string   `yaml:"client_id"`
+	APIKeys  []string `yaml:"api_keys"`
+	// ExpiresAt is RFC3339; empty means the credential never expires.
+	ExpiresAt string `yaml:"expires_at"`
+	Revoked   bool   `yaml:"revoked"`
+}
+
+// ExpiresAtTime parses ExpiresAt, returning (nil, nil) when unset.
+func (a AuthClient) ExpiresAtTime() (*time.Time, error) {
+	if a.ExpiresAt == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, a.ExpiresAt)
+	if err != nil {
+		return nil, fmt.Errorf("client %q: invalid expires_at %q: %w", a.ClientID, a.ExpiresAt, err)
+	}
+	return &t, nil
+}
+
+// Auth configures gateway-edge API-key authentication (a separate
+// concern from MCP's own protocol-level OAuth — see internal/auth's
+// package doc). Enabled defaults to false: an absent or disabled `auth:`
+// block means every request is allowed through unauthenticated, today's
+// behavior, unchanged, for any config that doesn't opt in.
+type Auth struct {
+	Enabled bool         `yaml:"enabled"`
+	Clients []AuthClient `yaml:"clients"`
+}
+
 // Upstream is one MCP server Portcullis can route to.
 type Upstream struct {
 	Name            string `yaml:"name"`
@@ -148,7 +185,8 @@ type Config struct {
 	Upstreams []Upstream `yaml:"upstreams"`
 	// MaxInflight bounds total concurrent /mcp requests gateway-wide
 	// (backpressure). Zero means "use defaultMaxInflight."
-	MaxInflight int `yaml:"max_inflight"`
+	MaxInflight int  `yaml:"max_inflight"`
+	Auth        Auth `yaml:"auth"`
 }
 
 // MaxInflightOrDefault returns MaxInflight, falling back to
@@ -225,6 +263,39 @@ func (c *Config) validate() error {
 	}
 	if c.MaxInflight < 0 {
 		return fmt.Errorf("max_inflight must be >= 0, got %d", c.MaxInflight)
+	}
+	if err := c.Auth.validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a Auth) validate() error {
+	seenKeys := make(map[string]string, len(a.Clients)) // api key -> owning client_id
+	seenIDs := make(map[string]bool, len(a.Clients))
+	for _, client := range a.Clients {
+		if client.ClientID == "" {
+			return fmt.Errorf("auth: a client has no client_id")
+		}
+		if seenIDs[client.ClientID] {
+			return fmt.Errorf("auth: duplicate client_id %q", client.ClientID)
+		}
+		seenIDs[client.ClientID] = true
+		if a.Enabled && len(client.APIKeys) == 0 {
+			return fmt.Errorf("auth: client %q has no api_keys", client.ClientID)
+		}
+		for _, key := range client.APIKeys {
+			if key == "" {
+				return fmt.Errorf("auth: client %q has an empty api key", client.ClientID)
+			}
+			if owner, ok := seenKeys[key]; ok {
+				return fmt.Errorf("auth: api key reused by both %q and %q -- keys must be unique per client", owner, client.ClientID)
+			}
+			seenKeys[key] = client.ClientID
+		}
+		if _, err := client.ExpiresAtTime(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
