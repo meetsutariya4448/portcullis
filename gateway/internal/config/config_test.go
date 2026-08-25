@@ -83,6 +83,57 @@ func TestConfig_Validate_RejectsInvalidRetryMaxDelay(t *testing.T) {
 	assertValidateError(t, cfg, "max_delay")
 }
 
+func TestCircuitBreakerPolicy_DurationParsing(t *testing.T) {
+	unset := CircuitBreakerPolicy{}
+	if d, err := unset.WindowDuration(); err != nil || d != 0 {
+		t.Fatalf("expected (0, nil) for unset Window, got (%v, %v)", d, err)
+	}
+	if d, err := unset.CooldownDuration(); err != nil || d != 0 {
+		t.Fatalf("expected (0, nil) for unset Cooldown, got (%v, %v)", d, err)
+	}
+
+	bad := CircuitBreakerPolicy{Cooldown: "not-a-duration"}
+	if _, err := bad.CooldownDuration(); err == nil {
+		t.Fatal("expected an error for an invalid cooldown")
+	}
+}
+
+func TestConfig_Validate_RejectsNegativeMinSamples(t *testing.T) {
+	cfg := validConfig()
+	cfg.Upstreams[0].CircuitBreaker.MinSamples = -1
+	assertValidateError(t, cfg, "min_samples")
+}
+
+func TestConfig_Validate_RejectsOutOfRangeThreshold(t *testing.T) {
+	cfg := validConfig()
+	cfg.Upstreams[0].CircuitBreaker.Threshold = 1.5
+	assertValidateError(t, cfg, "threshold")
+
+	cfg2 := validConfig()
+	cfg2.Upstreams[0].CircuitBreaker.Threshold = -0.1
+	assertValidateError(t, cfg2, "threshold")
+}
+
+func TestConfig_Validate_AcceptsZeroThresholdAsUnset(t *testing.T) {
+	cfg := validConfig()
+	cfg.Upstreams[0].CircuitBreaker.Threshold = 0
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("threshold=0 (unset sentinel) should be valid, got: %v", err)
+	}
+}
+
+func TestConfig_Validate_RejectsInvalidBreakerWindow(t *testing.T) {
+	cfg := validConfig()
+	cfg.Upstreams[0].CircuitBreaker.Window = "not-a-duration"
+	assertValidateError(t, cfg, "window")
+}
+
+func TestConfig_Validate_RejectsInvalidBreakerCooldown(t *testing.T) {
+	cfg := validConfig()
+	cfg.Upstreams[0].CircuitBreaker.Cooldown = "not-a-duration"
+	assertValidateError(t, cfg, "cooldown")
+}
+
 func assertValidateError(t *testing.T, cfg *Config, wantSubstring string) {
 	t.Helper()
 	err := cfg.validate()

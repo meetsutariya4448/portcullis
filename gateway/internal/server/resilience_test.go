@@ -139,6 +139,53 @@ func TestForward_DoesNotRetryPostSendFailure(t *testing.T) {
 	}
 }
 
+// TestForward_NativeBreakerOpensAfterRepeatedFailures proves the circuit
+// breaker now guards the native path too (previously only translate.Pool
+// had one) -- repeated connection failures trip it, after which requests
+// fail fast with "circuit breaker open" instead of attempting to connect.
+func TestForward_NativeBreakerOpensAfterRepeatedFailures(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	deadAddr := l.Addr().String()
+	l.Close()
+
+	cfg := &config.Config{Upstreams: []config.Upstream{{
+		Name:      "unhealthy-upstream",
+		Namespace: "unhealthy",
+		URL:       "http://" + deadAddr,
+		Retry:     config.RetryPolicy{MaxAttempts: 1}, // isolate breaker behavior from retry behavior
+		CircuitBreaker: config.CircuitBreakerPolicy{
+			Window: "1s", Cooldown: "1s", MinSamples: 2, Threshold: 0.5,
+		},
+	}}}
+	log := discardLogger()
+	rtr, err := router.New(cfg, log)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	gw := New(rtr, log, 100)
+
+	// Trip the breaker: minSamples=2 failing requests at 100% error rate.
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, nativeRequest("unhealthy.echo"))
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("request %d: expected 502 (connection failure), got %d", i, rec.Code)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, nativeRequest("unhealthy.echo"))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 (circuit breaker open) once tripped, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "circuit breaker") {
+		t.Fatalf("expected the error to mention the circuit breaker, got: %s", rec.Body.String())
+	}
+}
+
 // TestForward_BulkheadBoundsNativeConcurrency proves a per-upstream
 // max_concurrent actually caps how many requests can be in flight to that
 // upstream at once -- the native path had no concurrency ceiling at all

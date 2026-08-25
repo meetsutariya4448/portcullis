@@ -60,6 +60,41 @@ func (r RetryPolicy) MaxDelayDuration() (time.Duration, error) {
 	return d, nil
 }
 
+// CircuitBreakerPolicy configures per-upstream circuit-breaker tuning. The
+// zero value means "use the translate package default" for every field.
+type CircuitBreakerPolicy struct {
+	Window     string  `yaml:"window"`
+	MinSamples int     `yaml:"min_samples"`
+	Threshold  float64 `yaml:"threshold"`
+	Cooldown   string  `yaml:"cooldown"`
+}
+
+// WindowDuration parses Window, returning (0, nil) when unset so the
+// caller can substitute its own default.
+func (c CircuitBreakerPolicy) WindowDuration() (time.Duration, error) {
+	if c.Window == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.Window)
+	if err != nil {
+		return 0, fmt.Errorf("invalid circuit_breaker.window %q: %w", c.Window, err)
+	}
+	return d, nil
+}
+
+// CooldownDuration parses Cooldown, returning (0, nil) when unset so the
+// caller can substitute its own default.
+func (c CircuitBreakerPolicy) CooldownDuration() (time.Duration, error) {
+	if c.Cooldown == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.Cooldown)
+	if err != nil {
+		return 0, fmt.Errorf("invalid circuit_breaker.cooldown %q: %w", c.Cooldown, err)
+	}
+	return d, nil
+}
+
 // Upstream is one MCP server Portcullis can route to.
 type Upstream struct {
 	Name            string `yaml:"name"`
@@ -80,8 +115,9 @@ type Upstream struct {
 	// on the native forward path (bulkhead isolation). Zero means "use
 	// defaultMaxConcurrent." Not consulted for legacy upstreams —
 	// MaxPoolSize already serves this role there.
-	MaxConcurrent int         `yaml:"max_concurrent"`
-	Retry         RetryPolicy `yaml:"retry"`
+	MaxConcurrent  int                  `yaml:"max_concurrent"`
+	Retry          RetryPolicy          `yaml:"retry"`
+	CircuitBreaker CircuitBreakerPolicy `yaml:"circuit_breaker"`
 }
 
 // MaxConcurrentOrDefault returns MaxConcurrent, falling back to
@@ -172,6 +208,18 @@ func (c *Config) validate() error {
 			return fmt.Errorf("upstream %q: %w", u.Name, err)
 		}
 		if _, err := u.Retry.MaxDelayDuration(); err != nil {
+			return fmt.Errorf("upstream %q: %w", u.Name, err)
+		}
+		if u.CircuitBreaker.MinSamples < 0 {
+			return fmt.Errorf("upstream %q: circuit_breaker.min_samples must be >= 0, got %d", u.Name, u.CircuitBreaker.MinSamples)
+		}
+		if u.CircuitBreaker.Threshold < 0 || u.CircuitBreaker.Threshold > 1 {
+			return fmt.Errorf("upstream %q: circuit_breaker.threshold must be in [0,1], got %v", u.Name, u.CircuitBreaker.Threshold)
+		}
+		if _, err := u.CircuitBreaker.WindowDuration(); err != nil {
+			return fmt.Errorf("upstream %q: %w", u.Name, err)
+		}
+		if _, err := u.CircuitBreaker.CooldownDuration(); err != nil {
 			return fmt.Errorf("upstream %q: %w", u.Name, err)
 		}
 	}

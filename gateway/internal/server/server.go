@@ -167,10 +167,11 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 // forward dispatches to the legacy or native forward path and wraps the
 // whole attempt in upstream's retry policy. retry.Do re-invokes fn from
 // scratch on a retryable failure — for the legacy path that means a fresh
-// Pool.Forward call (which itself starts with a fresh session lease); for
-// the native path, forwardNative re-dials from scratch. Neither path
-// decides retryability once up front — each attempt's own outcome decides
-// whether the next attempt happens.
+// Pool.Forward call (which itself starts with a fresh session lease and a
+// fresh breaker.Allow() check); for the native path, forwardNative
+// likewise re-checks the breaker and bulkhead on every attempt. Neither
+// path's Allow() check is done once up front — each retry attempt gets an
+// independent, current admission decision.
 func (s *Server) forward(ctx context.Context, upstream *router.Upstream, body []byte, headers http.Header) (*http.Response, error) {
 	var resp *http.Response
 	err := retry.Do(ctx, upstream.RetryConfig, func(attempt int) error {
@@ -188,14 +189,17 @@ func (s *Server) forward(ctx context.Context, upstream *router.Upstream, body []
 }
 
 // forwardNative sends body directly to a native (2026-07-28) upstream,
-// guarded by that upstream's bulkhead. A failure before the request
-// reached the upstream (bulkhead wait canceled, a pre-connect dial
-// failure) is returned bare so retry.Do may retry it; anything after the
-// request was handed to the upstream is wrapped in retry.NonRetryable --
-// MCP tool calls are not guaranteed idempotent, so a failure that might
-// mean the upstream already started processing the call must never be
-// retried automatically.
+// guarded by that upstream's circuit breaker and bulkhead. Mirrors the
+// breaker/error-wrapping pattern translate.Pool.Forward already uses for
+// the legacy path: a failure before the request reached the upstream
+// (breaker open, bulkhead wait canceled, a pre-connect dial failure) is
+// returned bare so retry.Do may retry it; anything after the request was
+// handed to the upstream is wrapped in retry.NonRetryable.
 func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, body []byte, headers http.Header) (*http.Response, error) {
+	if !upstream.Breaker.Allow() {
+		return nil, retry.NonRetryable(translate.ErrCircuitOpen)
+	}
+
 	waitStart := time.Now()
 	if err := upstream.Bulkhead.Acquire(ctx); err != nil {
 		return nil, retry.NonRetryable(err)
@@ -210,12 +214,15 @@ func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, b
 	probeCtx, connEstablished := retry.WithConnProbe(ctx)
 	outReq, err := http.NewRequestWithContext(probeCtx, http.MethodPost, upstream.URL, bytes.NewReader(body))
 	if err != nil {
+		upstream.Breaker.Record(false)
 		return nil, retry.NonRetryable(err)
 	}
 	copyHeaders(outReq.Header, headers)
 
 	resp, err := upstream.Client.Do(outReq)
 	if err != nil {
+		upstream.Breaker.Record(false)
+		metrics.CircuitBreakerState.WithLabelValues(upstream.Name).Set(float64(upstream.Breaker.State()))
 		if connEstablished() {
 			// The request reached the upstream (or we can't prove it
 			// didn't) -- not safe to retry automatically.
@@ -223,6 +230,8 @@ func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, b
 		}
 		return nil, err // pre-connect failure: safe to retry
 	}
+	upstream.Breaker.Record(true)
+	metrics.CircuitBreakerState.WithLabelValues(upstream.Name).Set(float64(upstream.Breaker.State()))
 	return resp, nil
 }
 

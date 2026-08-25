@@ -19,6 +19,16 @@ var (
 		Buckets: prometheus.DefBuckets,
 	}, []string{"method", "tool", "status"})
 
+	// CircuitBreakerState is the per-upstream breaker state
+	// (0=closed, 1=open, 2=half_open — translate.BreakerState's values),
+	// updated on every Allow()/Record() call. This is what a chaos-demo
+	// dashboard graphs to show the closed->open->half_open->closed
+	// lifecycle live.
+	CircuitBreakerState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "portcullis_circuit_breaker_state",
+		Help: "Per-upstream circuit breaker state: 0=closed, 1=open, 2=half_open.",
+	}, []string{"upstream"})
+
 	// RetryAttemptsTotal counts every forward attempt made (including the
 	// first), per upstream. attempts_total minus RequestsTotal's request
 	// count for the same upstream is how many extra attempts retries cost.
@@ -64,6 +74,7 @@ func init() {
 	prometheus.MustRegister(
 		RequestsTotal,
 		GatewayLatency,
+		CircuitBreakerState,
 		RetryAttemptsTotal,
 		BulkheadInflight,
 		BulkheadWaitSeconds,

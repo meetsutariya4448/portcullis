@@ -65,6 +65,25 @@ func NewPool(url string, client *http.Client, log *slog.Logger, maxSize int) *Po
 	}
 }
 
+// WithBreakerConfig replaces the pool's circuit breaker with one built
+// from cfg, and returns the pool for chaining at the NewPool call site.
+// Intended to be called at most once, right after NewPool, when the
+// upstream's config declares a custom circuit_breaker block; the zero
+// value of BreakerConfig is a no-op (keeps the default breaker NewPool
+// already built). Not safe to call concurrently with Forward.
+func (p *Pool) WithBreakerConfig(cfg BreakerConfig) *Pool {
+	if cfg != (BreakerConfig{}) {
+		p.breaker = NewCircuitBreakerWithConfig(cfg)
+	}
+	return p
+}
+
+// BreakerState reports the pool's circuit breaker state, for
+// metrics/observability only.
+func (p *Pool) BreakerState() BreakerState {
+	return p.breaker.State()
+}
+
 // Forward leases a session, forwards body to the legacy upstream over that
 // session, and returns the upstream's response for the caller to relay
 // unchanged (status, headers, and body). The caller must close the

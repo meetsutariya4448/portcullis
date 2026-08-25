@@ -28,6 +28,33 @@ const (
 	stateHalfOpen
 )
 
+// BreakerState mirrors the breaker's internal state for external
+// observability (metrics, health checks) — a distinct exported type from
+// the internal breakerState so callers can't come to depend on the
+// internal enum's exact values. Never gate request admission on State();
+// use Allow(), which also handles the half-open single-trial bookkeeping
+// State() deliberately doesn't touch.
+type BreakerState int
+
+const (
+	StateClosed BreakerState = iota
+	StateOpen
+	StateHalfOpen
+)
+
+func (s BreakerState) String() string {
+	switch s {
+	case StateClosed:
+		return "closed"
+	case StateOpen:
+		return "open"
+	case StateHalfOpen:
+		return "half_open"
+	default:
+		return "unknown"
+	}
+}
+
 type bucket struct {
 	start     time.Time
 	successes int
@@ -55,7 +82,41 @@ type CircuitBreaker struct {
 // NewCircuitBreaker returns a closed circuit breaker using the task's
 // stated policy: 50% error rate over a 10s window.
 func NewCircuitBreaker() *CircuitBreaker {
-	return newCircuitBreaker(defaultBreakerWindow, defaultBreakerBuckets, defaultBreakerMinSamples, defaultBreakerThreshold, defaultBreakerCooldown)
+	return NewCircuitBreakerWithConfig(BreakerConfig{})
+}
+
+// BreakerConfig holds tunable, YAML-configurable circuit-breaker
+// parameters. Any zero field falls back to the package default for that
+// parameter — the bucket count is not exposed here; it's an internal
+// resolution detail of the sliding window, not a tuning knob operators
+// need.
+type BreakerConfig struct {
+	Window     time.Duration
+	MinSamples int
+	Threshold  float64
+	Cooldown   time.Duration
+}
+
+// NewCircuitBreakerWithConfig builds a closed circuit breaker from cfg,
+// substituting the package default for any zero field.
+func NewCircuitBreakerWithConfig(cfg BreakerConfig) *CircuitBreaker {
+	window := cfg.Window
+	if window <= 0 {
+		window = defaultBreakerWindow
+	}
+	minSamples := cfg.MinSamples
+	if minSamples <= 0 {
+		minSamples = defaultBreakerMinSamples
+	}
+	threshold := cfg.Threshold
+	if threshold <= 0 {
+		threshold = defaultBreakerThreshold
+	}
+	cooldown := cfg.Cooldown
+	if cooldown <= 0 {
+		cooldown = defaultBreakerCooldown
+	}
+	return newCircuitBreaker(window, defaultBreakerBuckets, minSamples, threshold, cooldown)
 }
 
 // newCircuitBreaker builds a breaker with explicit tuning, letting tests
@@ -69,6 +130,15 @@ func newCircuitBreaker(window time.Duration, buckets int, minSamples int, thresh
 		cooldown:   cooldown,
 		buckets:    make([]bucket, buckets),
 	}
+}
+
+// State reports the breaker's current state, for metrics/observability
+// only — see the BreakerState doc comment on why this must never gate
+// admission directly.
+func (b *CircuitBreaker) State() BreakerState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return BreakerState(b.state)
 }
 
 // Allow reports whether a request may proceed. Every call to Allow that
