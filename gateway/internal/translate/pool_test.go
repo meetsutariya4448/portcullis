@@ -13,6 +13,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
 )
 
 func testLogger() *slog.Logger {
@@ -130,7 +134,7 @@ func TestPool_ForwardSucceedsWithoutCallerHandlingSession(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
+	pool := NewPool("test-upstream", srv.URL, srv.Client(), testLogger(), 0)
 
 	resp, err := pool.Forward(context.Background(), requestBody())
 	if err != nil {
@@ -159,7 +163,7 @@ func TestPool_ReusesSessionAcrossRequests(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
+	pool := NewPool("test-upstream", srv.URL, srv.Client(), testLogger(), 0)
 
 	for i := 0; i < 5; i++ {
 		resp, err := pool.Forward(context.Background(), requestBody())
@@ -177,12 +181,43 @@ func TestPool_ReusesSessionAcrossRequests(t *testing.T) {
 	}
 }
 
+// TestPool_RecordsSessionReuseAndCreationMetrics proves lease's
+// reuse-vs-create distinction actually reaches the metrics package: a
+// unique upstream name isolates this test's counters from every other
+// test in this file, since metrics are package-level global state.
+func TestPool_RecordsSessionReuseAndCreationMetrics(t *testing.T) {
+	fake := newFakeLegacyServer()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	const upstreamName = "metrics-test-upstream"
+	pool := NewPool(upstreamName, srv.URL, srv.Client(), testLogger(), 0)
+
+	createdBefore := testutil.ToFloat64(metrics.LegacySessionCreatedTotal.WithLabelValues(upstreamName))
+	reusedBefore := testutil.ToFloat64(metrics.LegacySessionReusedTotal.WithLabelValues(upstreamName))
+
+	for i := 0; i < 3; i++ {
+		resp, err := pool.Forward(context.Background(), requestBody())
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	if got := testutil.ToFloat64(metrics.LegacySessionCreatedTotal.WithLabelValues(upstreamName)) - createdBefore; got != 1 {
+		t.Fatalf("expected exactly 1 session created (the first Forward's handshake), got %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.LegacySessionReusedTotal.WithLabelValues(upstreamName)) - reusedBefore; got != 2 {
+		t.Fatalf("expected exactly 2 session reuses (the 2nd and 3rd Forward), got %v", got)
+	}
+}
+
 func TestPool_RecyclesDeadSession(t *testing.T) {
 	fake := newFakeLegacyServer()
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
+	pool := NewPool("test-upstream", srv.URL, srv.Client(), testLogger(), 0)
 
 	resp, err := pool.Forward(context.Background(), requestBody())
 	if err != nil {
@@ -213,7 +248,7 @@ func TestPool_ForwardReturnsErrUnsupportedMRTR(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
+	pool := NewPool("test-upstream", srv.URL, srv.Client(), testLogger(), 0)
 
 	_, err := pool.Forward(context.Background(), requestBody())
 	if !errors.Is(err, ErrUnsupportedMRTR) {
@@ -239,7 +274,7 @@ func TestPool_ExhaustionFailsFast(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
+	pool := NewPool("test-upstream", srv.URL, srv.Client(), testLogger(), 0)
 	pool.maxSize = 1
 
 	sess, err := pool.lease(context.Background())
@@ -263,7 +298,7 @@ func TestPool_CircuitBreakerOpensAfterRepeatedHandshakeFailures(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
+	pool := NewPool("test-upstream", srv.URL, srv.Client(), testLogger(), 0)
 
 	var lastErr error
 	for i := 0; i < defaultBreakerMinSamples; i++ {
@@ -287,7 +322,7 @@ func TestPool_PoolExhaustionDoesNotTripBreaker(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 
-	pool := NewPool(srv.URL, srv.Client(), testLogger(), 0)
+	pool := NewPool("test-upstream", srv.URL, srv.Client(), testLogger(), 0)
 	pool.maxSize = 1
 
 	sess, err := pool.lease(context.Background())

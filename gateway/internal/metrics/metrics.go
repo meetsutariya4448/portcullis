@@ -114,6 +114,23 @@ var (
 		Name: "portcullis_bulkhead_rejected_total",
 		Help: "Total requests rejected because a per-upstream bulkhead slot could not be acquired.",
 	}, []string{"upstream"})
+
+	// LegacySessionReusedTotal counts legacy-upstream forward attempts
+	// that reused an already-established session from the pool, rather
+	// than paying the initialize/initialized handshake cost again.
+	LegacySessionReusedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_legacy_session_reused_total",
+		Help: "Total legacy-upstream forwards that reused a pooled session.",
+	}, []string{"upstream"})
+
+	// LegacySessionCreatedTotal counts legacy-upstream forward attempts
+	// that established a brand new session via the handshake. Together
+	// with LegacySessionReusedTotal this gives the pool's session reuse
+	// rate: reused / (reused + created).
+	LegacySessionCreatedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_legacy_session_created_total",
+		Help: "Total legacy-upstream forwards that established a brand new session via the handshake.",
+	}, []string{"upstream"})
 )
 
 func init() {
@@ -132,5 +149,7 @@ func init() {
 		QuotaRejectedTotal,
 		UpstreamLatency,
 		BulkheadRejectedTotal,
+		LegacySessionReusedTotal,
+		LegacySessionCreatedTotal,
 	)
 }

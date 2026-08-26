@@ -110,7 +110,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 			RetryConfig:     retryCfg,
 		}
 		if u.ProtocolVersion == translate.LegacyProtocolVersion {
-			upstream.LegacyPool = translate.NewPool(u.URL, client, log, u.MaxPoolSize).WithBreakerConfig(breakerCfg)
+			upstream.LegacyPool = translate.NewPool(u.Name, u.URL, client, log, u.MaxPoolSize).WithBreakerConfig(breakerCfg)
 		}
 		upstreams[u.Namespace] = upstream
 	}

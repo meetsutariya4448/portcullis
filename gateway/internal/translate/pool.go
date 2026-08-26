@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
 )
 
@@ -38,6 +39,7 @@ const DefaultMaxPoolSize = 8
 // (LIFO) keeps a small hot subset of sessions/connections warm instead of
 // round-robining evenly across all of them.
 type Pool struct {
+	name    string
 	url     string
 	client  *http.Client
 	log     *slog.Logger
@@ -49,14 +51,17 @@ type Pool struct {
 	live int        // sessions currently created (idle + leased), <= maxSize
 }
 
-// NewPool builds a session pool for a single legacy upstream. client should
-// already be configured with the upstream's timeout. maxSize <= 0 means
-// "use DefaultMaxPoolSize."
-func NewPool(url string, client *http.Client, log *slog.Logger, maxSize int) *Pool {
+// NewPool builds a session pool for a single legacy upstream. name is the
+// upstream's configured name, used only to label the session
+// reuse/creation metrics recorded in lease. client should already be
+// configured with the upstream's timeout. maxSize <= 0 means "use
+// DefaultMaxPoolSize."
+func NewPool(name, url string, client *http.Client, log *slog.Logger, maxSize int) *Pool {
 	if maxSize <= 0 {
 		maxSize = DefaultMaxPoolSize
 	}
 	return &Pool{
+		name:    name,
 		url:     url,
 		client:  client,
 		log:     log,
@@ -170,6 +175,7 @@ func (p *Pool) lease(ctx context.Context) (*Session, error) {
 			break
 		}
 		if p.healthCheck(ctx, sess) {
+			metrics.LegacySessionReusedTotal.WithLabelValues(p.name).Inc()
 			return sess, nil
 		}
 		p.log.Warn("translate: discarding dead legacy session", "upstream", p.url, "session_id", sess.ID)
@@ -185,6 +191,7 @@ func (p *Pool) lease(ctx context.Context) (*Session, error) {
 		p.dropLive()
 		return nil, fmt.Errorf("establishing legacy session: %w", err)
 	}
+	metrics.LegacySessionCreatedTotal.WithLabelValues(p.name).Inc()
 	return sess, nil
 }
 
