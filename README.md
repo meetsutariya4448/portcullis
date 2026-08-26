@@ -77,6 +77,19 @@ cd control && python3 evals/run_eval.py
 ./bench/run_bench.sh
 ```
 
+## Chaos demo
+
+`./bench/chaos_demo.sh` (needs Docker) is a live terminal dashboard: it
+brings up the gateway and a real upstream, then in real time — a
+redrawn-in-place panel, not scrolling logs — shows the circuit breaker
+sitting CLOSED, injects an actual failure (`docker compose stop` on the
+upstream, not a simulated one), and watches it open, hold through its
+cooldown, probe recovery via a HALF_OPEN trial, and close again once the
+upstream comes back. The committed, reproducible timing numbers this is
+illustrating are in [Measured results](#measured-results) below and in
+[bench/results.md](bench/results.md) (`bench/run_chaos_bench.sh`) — this
+script is meant to be watched, not archived.
+
 ## Measured results
 
 These are real, measured numbers, not targets — both source files caveat
