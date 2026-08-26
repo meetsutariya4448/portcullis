@@ -47,9 +47,11 @@ type Upstream struct {
 	RetryConfig     retry.Config
 }
 
-// Router maps a tool/resource/prompt namespace to its upstream.
+// Router maps a tool/resource/prompt namespace to its ordered failover
+// group of upstreams (primary first — see config.Config.validate's doc
+// comment on namespace grouping).
 type Router struct {
-	upstreams map[string]*Upstream
+	upstreams map[string][]*Upstream
 }
 
 // New builds a Router from the loaded config, constructing one pooled
@@ -57,9 +59,10 @@ type Router struct {
 // Upstream doc comment for which path actually uses the breaker/bulkhead),
 // and — for upstreams declaring protocol_version: "2025-11-25" — a
 // translate.Pool that performs the legacy handshake and holds sessions on
-// the client's behalf.
+// the client's behalf. Multiple entries sharing a Namespace become one
+// ordered failover group, in the order they appear in cfg.Upstreams.
 func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
-	upstreams := make(map[string]*Upstream, len(cfg.Upstreams))
+	upstreams := make(map[string][]*Upstream, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
 		timeout, err := u.TimeoutDuration()
 		if err != nil {
@@ -129,7 +132,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 		if u.ProtocolVersion == translate.LegacyProtocolVersion {
 			upstream.LegacyPool = translate.NewPool(u.Name, u.URL, client, log, u.MaxPoolSize).WithBreakerConfig(breakerCfg)
 		}
-		upstreams[u.Namespace] = upstream
+		upstreams[u.Namespace] = append(upstreams[u.Namespace], upstream)
 	}
 	return &Router{upstreams: upstreams}, nil
 }
@@ -186,11 +189,13 @@ func SplitName(name string) (namespace, tool string, ok bool) {
 	return name[:i], name[i+1:], true
 }
 
-// Resolve looks up the upstream registered for namespace.
-func (r *Router) Resolve(namespace string) (*Upstream, error) {
-	u, ok := r.upstreams[namespace]
+// Resolve looks up the ordered failover group of upstreams registered
+// for namespace (primary first). A namespace with a single configured
+// upstream returns a single-element group.
+func (r *Router) Resolve(namespace string) ([]*Upstream, error) {
+	group, ok := r.upstreams[namespace]
 	if !ok {
 		return nil, fmt.Errorf("no upstream configured for namespace %q", namespace)
 	}
-	return u, nil
+	return group, nil
 }

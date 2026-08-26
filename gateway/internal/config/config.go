@@ -314,21 +314,26 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
-	seen := make(map[string]bool, len(c.Upstreams))
+	// Multiple entries MAY share a Namespace -- that's an ordered
+	// failover group, first entry primary (see router.New). Name must
+	// still be unique across the whole config: it's the label on every
+	// per-upstream metric, and now the only thing distinguishing
+	// same-namespace group members from each other.
+	seenNames := make(map[string]bool, len(c.Upstreams))
 	for _, u := range c.Upstreams {
 		if u.Name == "" {
 			return fmt.Errorf("upstream has no name")
 		}
+		if seenNames[u.Name] {
+			return fmt.Errorf("duplicate upstream name %q", u.Name)
+		}
+		seenNames[u.Name] = true
 		if u.Namespace == "" {
 			return fmt.Errorf("upstream %q: namespace is required", u.Name)
 		}
 		if u.URL == "" {
 			return fmt.Errorf("upstream %q: url is required", u.Name)
 		}
-		if seen[u.Namespace] {
-			return fmt.Errorf("duplicate upstream namespace %q", u.Namespace)
-		}
-		seen[u.Namespace] = true
 		if _, err := u.TimeoutDuration(); err != nil {
 			return err
 		}

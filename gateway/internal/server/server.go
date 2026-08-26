@@ -272,11 +272,16 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream, err := s.router.Resolve(namespace)
+	group, err := s.router.Resolve(namespace)
 	if err != nil {
 		s.writeGatewayError(w, r, req.Method, headers.Name, http.StatusBadGateway, req.ID, err.Error(), handlerStart, err)
 		return
 	}
+	// Failover across the rest of group lands in a later commit; for now
+	// this resolves and uses only the primary (group[0]), so behavior is
+	// unchanged -- this commit is purely the router's data-model shift
+	// from one upstream per namespace to an ordered group.
+	upstream := group[0]
 	span.SetAttributes(attribute.String("portcullis.upstream", upstream.Name))
 
 	preUpstream := time.Since(handlerStart)

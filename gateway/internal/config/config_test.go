@@ -53,6 +53,24 @@ func validConfig() *Config {
 	}}
 }
 
+func TestConfig_Validate_AllowsMultipleUpstreamsSharingANamespace(t *testing.T) {
+	cfg := &Config{Upstreams: []Upstream{
+		{Name: "weather-primary", Namespace: "weather", URL: "http://localhost:9001/mcp"},
+		{Name: "weather-fallback", Namespace: "weather", URL: "http://localhost:9002/mcp"},
+	}}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("expected a shared namespace (failover group) to validate, got: %v", err)
+	}
+}
+
+func TestConfig_Validate_RejectsDuplicateUpstreamName(t *testing.T) {
+	cfg := &Config{Upstreams: []Upstream{
+		{Name: "weather", Namespace: "weather", URL: "http://localhost:9001/mcp"},
+		{Name: "weather", Namespace: "other", URL: "http://localhost:9002/mcp"},
+	}}
+	assertValidateError(t, cfg, "duplicate upstream name")
+}
+
 func TestConfig_Validate_AcceptsValidConfig(t *testing.T) {
 	if err := validConfig().validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
