@@ -144,3 +144,207 @@ the dropped scenario(s) is still saved under `bench/.raw/` if you want
 to inspect it anyway -- it's just not reported as a scaling result.
 
 **These numbers are machine-specific.** Re-run on your own hardware before drawing conclusions.
+
+---
+
+## Milestone 6 (concurrency sweep, resource usage, circuit-breaker timing)
+
+Generated: 2026-08-26T03:51:01Z
+
+This section is **appended**, not a replacement for the Milestone 1
+section above (same standing rule: a new, honestly-caveated run gets
+recorded as a new section, not used to quietly overwrite an older one).
+It answers the parts of the original benchmark ask the Milestone 1 run
+didn't cover: concurrency scaling (1/10/100/500/1000), gateway memory/CPU
+under load, legacy session reuse rate, and live circuit-breaker
+recovery timing. Machine is the same 8-core Apple M2 as above, this
+time on an already-warmed Docker Desktop instance (no cold-VM caveat).
+
+Produced by two new scripts, `bench/run_concurrency_sweep.sh` and
+`bench/run_chaos_bench.sh` (both reuse `bench/lib.sh`, extracted from
+`run_bench.sh` in this same pass so the three scripts share one copy of
+the median/hey-parsing logic instead of three that could drift). Raw
+per-level data is under `bench/.raw/`, same transparency precedent as
+the Milestone 1 section.
+
+**Methodology difference from Milestone 1's run:** each concurrency
+level runs for a fixed 10s **duration** (`hey -z`) rather than a fixed
+request count -- this keeps total sweep wall-clock cost predictable
+regardless of how many requests a given concurrency level manages to
+complete (a fixed compute-time budget per data point), 2 reps per level,
+median reported. Only the 1-gateway-instance topology is swept, not the
+3-instance/nginx cluster -- that topology already showed CPU contention
+in the Milestone 1 run at a single concurrency point (50), and adding a
+concurrency sweep on top of a topology already known to be
+contention-bound on this host wouldn't produce a meaningful result.
+
+**One real bug found and fixed while building this**: the first sweep
+run reported "n/a" for every memory/CPU sample -- `docker stats` was
+being pointed at a literal `gateway-solo` container name, but Compose
+(no `container_name:` override in `docker-compose.yml`) actually names
+it `portcullis-gateway-solo-1`. Fixed by resolving the real container ID
+via `docker compose ps -q gateway-solo` instead of guessing the name,
+verified against a live container, then the full sweep was re-run. The
+first (broken) run's numbers were discarded entirely, not partially
+reused -- this section reflects only the corrected run.
+
+### Concurrency sweep
+
+<!-- sweep table below is bench/.raw/concurrency-sweep.md, generated verbatim -->
+
+| Concurrency | Target | p50 (ms) | p95 (ms) | req/s | Non-200 | gateway-solo mem / cpu |
+|---:|---|---:|---:|---:|---|---|
+| 1 | native baseline | 0.15 | 0.30 | 6049.56 | none | n/a |
+| 1 | native via gateway | 0.30 | 0.45 | 2918.38 | none | 9.73MiB / 3.826GiB 49.85%; 10.3MiB / 3.826GiB 51.51% |
+| 1 | legacy baseline | 0.20 | 0.20 | 6409.05 | none | n/a |
+| 1 | legacy via gateway | 0.40 | 0.50 | 2296.88 | none | 10.16MiB / 3.826GiB 63.63%; 10.52MiB / 3.826GiB 62.91% |
+| 10 | native baseline | 0.40 | 0.60 | 23185.9 | none | n/a |
+| 10 | native via gateway | 0.70 | 1.30 | 8781.77 | none | 12.9MiB / 3.826GiB 108.75%; 12.77MiB / 3.826GiB 107.59% |
+| 10 | legacy baseline | 0.40 | 0.60 | 22135.2 | none | n/a |
+| 10 | legacy via gateway | 0.85 | 1.60 | 6833.65 | none | 13.43MiB / 3.826GiB 106.77%; 13.31MiB / 3.826GiB 108.57% |
+| 100 | native baseline | 2.60 | 4.50 | 30967.7 | none | n/a |
+| 100 | native via gateway | 11.50 | 141.25 | 3488.71 | none | 30.3MiB / 3.826GiB 104.78%; 33.46MiB / 3.826GiB 105.95% |
+| 100 | legacy baseline | 2.55 | 5.30 | 27453.2 | none | n/a |
+| 100 | legacy via gateway | 6.80 | 62.85 | 6406.71 | [503] 258 responses [503] 294 responses | 31.46MiB / 3.826GiB 104.64%; 32.4MiB / 3.826GiB 104.83% |
+| 500 | native baseline | 13.30 | 54.85 | 25178.7 | none | n/a |
+| 500 | native via gateway | 245.50 | 988.50 | 2218.29 | none | 85.44MiB / 3.826GiB 107.58%; 96.83MiB / 3.826GiB 97.72% |
+| 500 | legacy baseline | 14.05 | 56.55 | 23264.8 | none | n/a |
+| 500 | legacy via gateway | 74.15 | 111.90 | 7579.03 | [503] 47960 responses [503] 48081 responses | 89.39MiB / 3.826GiB 103.72%; 98.86MiB / 3.826GiB 105.20% |
+| 1000 | native baseline | 34.15 | 81.95 | 21588.4 | none | n/a |
+| 1000 | native via gateway | 839.40 | 1903.05 | 1831.66 | none | 153.8MiB / 3.826GiB 104.30%; 158.9MiB / 3.826GiB 100.38% |
+| 1000 | legacy baseline | 43.75 | 89.90 | 20027.4 | none | n/a |
+| 1000 | legacy via gateway | 99.75 | 196.25 | 9327.67 | [503] 80317 responses [503] 84183 responses | 146.7MiB / 3.826GiB 103.94%; 161.2MiB / 3.826GiB 102.98% |
+
+`gateway-solo mem / cpu` is one raw `docker stats --no-stream` sample
+per rep (2 per row), taken partway through that rep's 10s window --
+"n/a" for baseline rows since those hit the upstream containers
+directly, not the gateway. CPU% is relative to the 1.0-core limit
+`docker-compose.yml` sets for every bench container (per the Milestone 1
+section's own note), so ~100-108% means the gateway container is
+essentially saturating its single allotted core at concurrency ≥10, not
+that something is wrong.
+
+**Two genuinely different backpressure mechanisms show up at high
+concurrency, and the numbers reflect that honestly rather than being
+smoothed over:**
+
+- **Native path: queuing, not rejection.** No non-200 responses at any
+  concurrency level, but p50/p95 both climb sharply past c=100 (839ms
+  p50 at c=1000, vs. 34ms for the direct-upstream baseline at the same
+  concurrency) — consistent with `MaxConcurrent`'s default bulkhead size
+  (256, see `internal/config`'s `defaultMaxConcurrent`) being well below
+  the swept concurrency levels: requests beyond 256 in flight queue for
+  a bulkhead slot (blocking, bounded by the request's own context) rather
+  than being turned away. This is the gateway absorbing load at the cost
+  of latency, exactly as the bulkhead was designed to do — the bench
+  config doesn't override `max_concurrent`, so this is out-of-the-box
+  default behavior, not a tuned-for-the-demo number.
+- **Legacy path: outright rejection.** Real `503` responses start
+  appearing at c=100 (258-294 per 10s rep) and become the majority of
+  traffic at c≥500 (~48-84k of each rep's completed requests) — the
+  legacy session pool's `max_pool_size: 64` (set in
+  `bench/configs/gateway.yaml` specifically for this benchmark's
+  concurrency, per that file's own comment) is far below concurrency
+  100+, so `ErrPoolExhausted` fires and the gateway fails fast with 503
+  rather than queue. This is a deliberate, previously-documented design
+  choice (`translate.Pool.Forward`'s doc comment: pool exhaustion is
+  excluded from breaker accounting because it's a capacity signal about
+  Portcullis's own bound, not the upstream's health) showing up exactly
+  as designed under real load.
+
+### Legacy session reuse
+
+Sessions reused: 391,450. Sessions newly created: 64. **Reuse rate:
+100.0%** (`portcullis_legacy_session_reused_total` /
+`_created_total`, scraped from `gateway-solo`'s own `/metrics` before
+and after the full sweep). The 64 created sessions are essentially the
+pool filling up once at the very start of the run (`max_pool_size: 64`)
+— every one of the following ~391k legacy-path forwards across the
+entire sweep reused an already-established session rather than paying
+the `initialize`/`notifications/initialized` handshake again.
+
+### Circuit-breaker recovery timing (live, gateway-solo + upstream-native)
+
+Measured against `bench/configs/gateway.yaml`'s real circuit-breaker
+tuning (no `circuit_breaker:` block present, so this exercises
+`internal/translate`'s documented defaults: 10s window, 5 min samples,
+50% threshold, 5s cooldown), via an actual `docker compose stop`/`start`
+on `upstream-native` — not a simulated failure. This is the live,
+wall-clock-timed counterpart to `gateway/internal/server/chaos_test.go`
+(Milestone 5), which proves the state machine transitions correctly
+using short, test-only windows; this measures what that transition
+actually costs in real time against real (default) production tuning.
+
+| Phase | Wall-clock time |
+|---|---:|
+| Outage start → breaker opens (fast 503) | 1s |
+| Upstream restarted → first successful response | 5s |
+| **Total: outage start → fully recovered** | **6s** |
+
+The breaker opened after just **2 client-facing requests** — faster
+than the 5-sample minimum might suggest, because each client-facing
+request that fails pre-connect is itself retried internally (this bench
+config leaves `retry:` unset, so `internal/retry.DefaultConfig`'s 3
+attempts apply), and **every retry attempt independently records a
+breaker failure** (`forwardNative` calls `Breaker.Record(false)` on each
+failed `Do()`, not once per client-facing request). 2 requests × up to 3
+attempts each comfortably clears the 5-sample/50%-threshold bar within
+the first second.
+
+Recovery took 5s after the upstream came back — matching the configured
+5s cooldown almost exactly (the small remainder is the polling interval
+plus the half-open trial's own round trip). Full observed status
+timeline:
+
+```
+t+0s  502  upstream request failed
+t+1s  503  upstream circuit breaker is open
+t+1s  503  upstream circuit breaker is open
+t+1s  503  upstream circuit breaker is open
+t+2s  503  upstream circuit breaker is open
+t+2s  503  upstream circuit breaker is open
+t+2s  503  upstream circuit breaker is open
+t+3s  503  upstream circuit breaker is open
+t+3s  503  upstream circuit breaker is open
+t+4s  503  upstream circuit breaker is open
+t+4s  503  upstream circuit breaker is open
+t+5s  503  upstream circuit breaker is open
+t+5s  503  upstream circuit breaker is open
+t+5s  503  upstream circuit breaker is open
+t+6s  503  upstream circuit breaker is open
+t+6s  200  result: "echo"
+```
+
+This is the shape of graceful degradation a real client would
+experience during an actual upstream outage: one slow failed attempt
+(502, the request that triggers detection), then immediate, cheap 503s
+for the full cooldown window (no wasted connection attempts against a
+known-dead upstream), then a clean recovery the moment the upstream is
+healthy again and the half-open trial succeeds. Full raw timeline (every
+probe, with response bodies): `bench/.raw/chaos-timeline.log`.
+
+### AI scanner (control plane) latency and cost
+
+Already measured, sourced, and reported in full in
+[`control/evals/REPORT.md`](../control/evals/REPORT.md) — not re-run
+here, since doing so would mean fresh Anthropic API spend to reproduce
+numbers that are already rigorous and honestly caveated (see that
+report's own methodology/limitations section, including why it is
+explicitly *not* a held-out test set). Headline figures, full cascade,
+leave-one-out layer-2 indexing (139-row corpus, 101 benign / 38
+malicious):
+
+| | Value |
+|---|---|
+| Precision / Recall / F1 | 1.000 / 0.947 / 0.973 |
+| End-to-end latency (p50 / p95) | 12.67ms / 22.77ms |
+| Estimated cost per 1,000 tools scanned | $0.50 |
+| LLM (layer 3) invocation rate | 2.9% (4/139 rows) |
+
+See the linked report for the leave-one-seed-family-out comparison
+(the closer proxy for generalization to a genuinely unfamiliar attack,
+which scores lower — reported as a finding, not resolved away by
+picking the more flattering number), per-layer breakdowns, and the full
+methodology.
+
+**These numbers are machine-specific.** Re-run on your own hardware before drawing conclusions.

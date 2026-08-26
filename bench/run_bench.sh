@@ -22,6 +22,9 @@ COMPOSE_FILE="$REPO_ROOT/docker-compose.yml"
 RAW_DIR="$REPO_ROOT/bench/.raw"
 RESULTS_FILE="$REPO_ROOT/bench/results.md"
 
+# shellcheck disable=SC1091
+source "$REPO_ROOT/bench/lib.sh"
+
 REQUESTS=5000
 CONCURRENCY=50
 WARMUP_REQUESTS=500
@@ -85,46 +88,8 @@ GATEWAY_SOLO_URL="http://localhost:8081/mcp"
 GATEWAY_CLUSTER_URL="http://localhost:8090/mcp"
 
 # --- machine specs -----------------------------------------------------------
-
-detect_os() {
-  case "$(uname -s)" in
-    Darwin) sw_vers -productName; sw_vers -productVersion ;;
-    Linux)
-      if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        echo "${PRETTY_NAME:-Linux}"
-      else
-        uname -sr
-      fi
-      ;;
-    *) uname -sr ;;
-  esac
-}
-
-detect_cpu_model() {
-  case "$(uname -s)" in
-    Darwin) sysctl -n machdep.cpu.brand_string ;;
-    Linux) awk -F': ' '/model name/ {print $2; exit}' /proc/cpuinfo ;;
-    *) echo "unknown" ;;
-  esac
-}
-
-detect_cpu_cores() {
-  case "$(uname -s)" in
-    Darwin) sysctl -n hw.ncpu ;;
-    Linux) nproc ;;
-    *) echo "unknown" ;;
-  esac
-}
-
-detect_ram_gb() {
-  case "$(uname -s)" in
-    Darwin) awk 'BEGIN { printf "%.1f", '"$(sysctl -n hw.memsize)"' / 1073741824 }' ;;
-    Linux) awk '/MemTotal/ { printf "%.1f", $2/1048576 }' /proc/meminfo ;;
-    *) echo "unknown" ;;
-  esac
-}
+# detect_os/detect_cpu_model/detect_cpu_cores/detect_ram_gb now live in
+# bench/lib.sh (sourced above), shared with the other bench/*.sh scripts.
 
 OS_INFO="$(detect_os | tr '\n' ' ' | sed 's/ *$//')"
 CPU_MODEL="$(detect_cpu_model)"
@@ -184,16 +149,8 @@ echo "    session: $LEGACY_SESSION_ID" >&2
 # run is a sampling-noise signal, not a latency finding), so one run is not
 # a measurement, it's an anecdote.
 
-fact() { cat "$RAW_DIR/$1.$2"; }
-fact_exists() { [[ -f "$RAW_DIR/$1.$2" ]]; }
-
-median3() {
-  # Median of exactly 3 numbers: sort, take the middle.
-  printf '%s\n%s\n%s\n' "$1" "$2" "$3" | sort -n | awk 'NR==2'
-}
-
-min3() { printf '%s\n%s\n%s\n' "$1" "$2" "$3" | sort -n | awk 'NR==1'; }
-max3() { printf '%s\n%s\n%s\n' "$1" "$2" "$3" | sort -n | awk 'NR==3'; }
+# fact/fact_exists/median3/min3/max3/_parse_hey_output now live in
+# bench/lib.sh (sourced above), shared with the other bench/*.sh scripts.
 
 # Runs hey once against $url with $body_file/$headers, for $1 requests.
 # Prints hey's raw stdout+stderr. Used for both the discarded warmup and
@@ -202,40 +159,6 @@ _hey_once() {
   local n="$1" url="$2" body_file="$3"
   shift 3
   hey -n "$n" -c "$CONCURRENCY" -m POST -T "application/json" -D "$body_file" "$@" "$url" 2>&1
-}
-
-# Parses one hey run's raw output into p50/p95/p99/rps/status, or exits
-# loudly if any field can't be parsed -- never silently substitutes a
-# missing measurement.
-_parse_hey_output() {
-  local rep_label="$1" out="$2"
-
-  # This build of hey (0.1.5, Homebrew) prints latency-distribution labels
-  # as "50%% in ..." (doubled percent sign) instead of "50% in ...".
-  # Normalize for parsing only -- the raw per-rep log keeps the actual
-  # output verbatim.
-  local out_normalized
-  out_normalized="$(echo "$out" | sed 's/%%/%/g')"
-
-  local p50 p95 p99 rps
-  p50="$(echo "$out_normalized" | awk '/^ *50% in/ {print $3}')"
-  p95="$(echo "$out_normalized" | awk '/^ *95% in/ {print $3}')"
-  p99="$(echo "$out_normalized" | awk '/^ *99% in/ {print $3}')"
-  rps="$(echo "$out" | awk -F'[[:space:]]+' '/Requests\/sec:/ {print $3}')"
-
-  if [[ -z "$p50" || -z "$p95" || -z "$p99" || -z "$rps" ]]; then
-    echo "error: failed to parse hey output for '${rep_label}'. Raw output saved to $RAW_DIR/${rep_label}.hey.log" >&2
-    exit 1
-  fi
-
-  echo "$p50" >"$RAW_DIR/${rep_label}.p50"
-  echo "$p95" >"$RAW_DIR/${rep_label}.p95"
-  echo "$p99" >"$RAW_DIR/${rep_label}.p99"
-  echo "$rps" >"$RAW_DIR/${rep_label}.rps"
-
-  local statuses
-  statuses="$(echo "$out" | sed -n '/Status code distribution:/,$p' | grep -E '^\s*\[' | tr '\t' ' ' | sed 's/^ *//')"
-  echo "$statuses" >"$RAW_DIR/${rep_label}.status"
 }
 
 run_scenario() {
@@ -342,9 +265,7 @@ added_latency_ms() {
   awk -v g="$(fact "$gateway_label" "$metric")" -v b="$(fact "$baseline_label" "$metric")" 'BEGIN { printf "%.2f", (g - b) * 1000 }'
 }
 
-ms() {
-  awk -v s="$1" 'BEGIN { printf "%.2f", s * 1000 }'
-}
+# ms() now lives in bench/lib.sh (sourced above).
 
 # Renders "median (min–max)" in ms for a given metric fact + its .spread file.
 ms_with_spread() {
