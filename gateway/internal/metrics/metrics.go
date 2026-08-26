@@ -139,6 +139,14 @@ var (
 		Name: "portcullis_streaming_responses_total",
 		Help: "Total upstream responses relayed as a streaming (SSE) response.",
 	}, []string{"upstream"})
+
+	// UpstreamFailoverTotal counts requests that moved from one backend
+	// to the next within a namespace's failover group, by namespace and
+	// the (from, to) backend names.
+	UpstreamFailoverTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_upstream_failover_total",
+		Help: "Total requests that failed over from one backend to the next within a namespace's failover group.",
+	}, []string{"namespace", "from", "to"})
 )
 
 func init() {
@@ -160,5 +168,6 @@ func init() {
 		LegacySessionReusedTotal,
 		LegacySessionCreatedTotal,
 		StreamingResponsesTotal,
+		UpstreamFailoverTotal,
 	)
 }

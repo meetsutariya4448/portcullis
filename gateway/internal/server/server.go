@@ -277,20 +277,18 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		s.writeGatewayError(w, r, req.Method, headers.Name, http.StatusBadGateway, req.ID, err.Error(), handlerStart, err)
 		return
 	}
-	// Failover across the rest of group lands in a later commit; for now
-	// this resolves and uses only the primary (group[0]), so behavior is
-	// unchanged -- this commit is purely the router's data-model shift
-	// from one upstream per namespace to an ordered group.
-	upstream := group[0]
-	span.SetAttributes(attribute.String("portcullis.upstream", upstream.Name))
+	span.SetAttributes(attribute.String("portcullis.upstream", group[0].Name))
 
 	preUpstream := time.Since(handlerStart)
 
 	upstreamStart := time.Now()
 	forwardCtx, forwardSpan := tracer.Start(r.Context(), "portcullis.forward",
-		trace.WithAttributes(attribute.String("portcullis.upstream", upstream.Name)))
-	resp, err := s.forward(forwardCtx, upstream, body, r.Header)
+		trace.WithAttributes(attribute.String("portcullis.upstream", group[0].Name)))
+	resp, upstream, err := s.forward(forwardCtx, group, body, r.Header)
 	upstreamDuration := time.Since(upstreamStart)
+	// upstream is whichever group member actually served (or last failed
+	// on) the request -- may differ from group[0] if failover occurred.
+	span.SetAttributes(attribute.String("portcullis.upstream", upstream.Name))
 	if err != nil {
 		httpStatus, message := translateForwardError(err)
 		forwardSpan.SetStatus(codes.Error, message)
@@ -356,29 +354,64 @@ func traceLogArgs(ctx context.Context) []any {
 	return []any{"trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String()}
 }
 
-// forward dispatches to the legacy or native forward path and wraps the
-// whole attempt in upstream's retry policy. retry.Do re-invokes fn from
-// scratch on a retryable failure — for the legacy path that means a fresh
-// Pool.Forward call (which itself starts with a fresh session lease and a
-// fresh breaker.Allow() check); for the native path, forwardNative
-// likewise re-checks the breaker and bulkhead on every attempt. Neither
-// path's Allow() check is done once up front — each retry attempt gets an
-// independent, current admission decision.
-func (s *Server) forward(ctx context.Context, upstream *router.Upstream, body []byte, headers http.Header) (*http.Response, error) {
-	var resp *http.Response
-	err := retry.Do(ctx, upstream.RetryConfig, func(attempt int) error {
-		metrics.RetryAttemptsTotal.WithLabelValues(upstream.Name).Inc()
-		trace.SpanFromContext(ctx).AddEvent("attempt", trace.WithAttributes(attribute.Int("attempt", attempt)))
-
-		var attemptErr error
-		if upstream.LegacyPool != nil {
-			resp, attemptErr = upstream.LegacyPool.Forward(ctx, body)
-		} else {
-			resp, attemptErr = s.forwardNative(ctx, upstream, body, headers)
+// forward tries each backend in group in order (primary first), wrapping
+// each backend's own attempt in that backend's retry policy exactly as a
+// single-backend forward always has — retry.Do re-invokes fn from
+// scratch on a retryable failure (a fresh Pool.Forward call, or
+// forwardNative re-checking the breaker/bulkhead) with an independent,
+// current admission decision on every attempt.
+//
+// Moving to the NEXT backend is a separate decision from retrying the
+// SAME one: after a backend's retry.Do gives up, retry.SafeToRetryElsewhere
+// decides whether the failure was provably local (an already-open
+// breaker, a request that never built) — safe to try the next backend —
+// or whether the request may have reached the far side, in which case
+// forward stops immediately and returns that error, exactly as it always
+// has for a single backend. Failover never risks a duplicate side effect
+// any more than the existing same-backend retry boundary does.
+//
+// Returns the backend that actually served (or last failed on) the
+// request alongside the response/error, so the caller can attribute
+// logs/metrics/spans to it rather than always the primary.
+func (s *Server) forward(ctx context.Context, group []*router.Upstream, body []byte, headers http.Header) (*http.Response, *router.Upstream, error) {
+	var lastErr error
+	var lastUpstream *router.Upstream
+	for i, upstream := range group {
+		if err := ctx.Err(); err != nil {
+			return nil, upstream, err
 		}
-		return attemptErr
-	})
-	return resp, err
+		if i > 0 {
+			metrics.UpstreamFailoverTotal.WithLabelValues(upstream.Namespace, lastUpstream.Name, upstream.Name).Inc()
+			trace.SpanFromContext(ctx).AddEvent("failover", trace.WithAttributes(
+				attribute.String("from", lastUpstream.Name),
+				attribute.String("to", upstream.Name),
+			))
+		}
+		lastUpstream = upstream
+
+		var resp *http.Response
+		err := retry.Do(ctx, upstream.RetryConfig, func(attempt int) error {
+			metrics.RetryAttemptsTotal.WithLabelValues(upstream.Name).Inc()
+			trace.SpanFromContext(ctx).AddEvent("attempt", trace.WithAttributes(attribute.Int("attempt", attempt)))
+
+			var attemptErr error
+			if upstream.LegacyPool != nil {
+				resp, attemptErr = upstream.LegacyPool.Forward(ctx, body)
+			} else {
+				resp, attemptErr = s.forwardNative(ctx, upstream, body, headers)
+			}
+			return attemptErr
+		})
+		if err == nil {
+			return resp, upstream, nil
+		}
+		lastErr = err
+		if !retry.SafeToRetryElsewhere(err) {
+			return nil, upstream, err
+		}
+		// Safe to try the next backend, if any remain.
+	}
+	return nil, lastUpstream, lastErr
 }
 
 // forwardNative sends body directly to a native (2026-07-28) upstream,
