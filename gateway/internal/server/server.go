@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -298,8 +299,18 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 
 	postStart := time.Now()
 	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, copyErr := io.Copy(w, resp.Body)
+	var copyErr error
+	if isEventStream(resp.Header.Get("Content-Type")) {
+		metrics.StreamingResponsesTotal.WithLabelValues(upstream.Name).Inc()
+		if w.Header().Get("X-Accel-Buffering") == "" {
+			w.Header().Set("X-Accel-Buffering", "no")
+		}
+		w.WriteHeader(resp.StatusCode)
+		copyErr = streamCopy(r.Context(), w, resp.Body)
+	} else {
+		w.WriteHeader(resp.StatusCode)
+		_, copyErr = io.Copy(w, resp.Body)
+	}
 	postUpstream := time.Since(postStart)
 
 	gatewayOverhead := preUpstream + postUpstream
@@ -512,6 +523,48 @@ func copyHeaders(dst, src http.Header) {
 	for k, vv := range src {
 		for _, v := range vv {
 			dst.Add(k, v)
+		}
+	}
+}
+
+// isEventStream reports whether contentType (an upstream response's
+// Content-Type header) indicates a Server-Sent Events response, per
+// Streamable HTTP §Receiving Messages -- tolerating a trailing
+// "; charset=..." parameter.
+func isEventStream(contentType string) bool {
+	return strings.HasPrefix(strings.TrimSpace(strings.ToLower(contentType)), "text/event-stream")
+}
+
+// streamCopy relays src to dst a chunk at a time, flushing dst after
+// every write. io.Copy alone doesn't guarantee near-real-time delivery
+// of small SSE frames -- Go's server-side response writer can hold a
+// partial write in its own buffer until enough accumulates -- so this
+// exists specifically for streaming responses; every other response
+// still uses plain io.Copy. Stops as soon as ctx is done, which is what
+// makes "closing the SSE stream is the cancellation signal" (Streamable
+// HTTP §Cancellation) true in practice: ctx is the request's own
+// context, canceled the moment the client disconnects.
+func streamCopy(ctx context.Context, dst http.ResponseWriter, src io.Reader) error {
+	flusher, _ := dst.(http.Flusher)
+	buf := make([]byte, 4096)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return readErr
 		}
 	}
 }

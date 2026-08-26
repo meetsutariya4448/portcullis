@@ -84,9 +84,26 @@ func New(cfg *config.Config, log *slog.Logger) (*Router, error) {
 			// pre-connect failure while never retrying a request that
 			// actually reached the upstream.
 			DialContext: retry.ProbeDialContext((&net.Dialer{}).DialContext),
+			// ResponseHeaderTimeout (not http.Client.Timeout — see
+			// below) bounds only how long we wait for the upstream to
+			// start responding.
+			ResponseHeaderTimeout: timeout,
 		}
 		client := &http.Client{
-			Timeout: timeout,
+			// Deliberately no Timeout here: http.Client.Timeout bounds
+			// the ENTIRE request including body-read time, which would
+			// kill a legitimate long-lived streaming response (e.g. a
+			// subscriptions/listen SSE stream) after `timeout` elapses
+			// regardless of whether the upstream is healthy. Once
+			// headers arrive within ResponseHeaderTimeout above, a
+			// response — streamed or not — is now bounded only by the
+			// client's own connection lifetime (r.Context(), canceled
+			// when the client disconnects) and, on shutdown, the
+			// graceful-drain timeout. This also fixes a latent issue for
+			// ordinary large non-streaming responses, which previously
+			// could be killed mid-transfer by a healthy-but-slow
+			// upstream even though it had already started responding.
+			//
 			// otelhttp.NewTransport wraps the dial-probed transport one
 			// layer further: it starts a client-side span per real
 			// outbound call and injects the active trace context as a

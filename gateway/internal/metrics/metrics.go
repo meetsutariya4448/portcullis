@@ -131,6 +131,14 @@ var (
 		Name: "portcullis_legacy_session_created_total",
 		Help: "Total legacy-upstream forwards that established a brand new session via the handshake.",
 	}, []string{"upstream"})
+
+	// StreamingResponsesTotal counts responses relayed via the
+	// flush-per-chunk streaming copy loop (Content-Type: text/event-stream)
+	// rather than the default buffered copy.
+	StreamingResponsesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_streaming_responses_total",
+		Help: "Total upstream responses relayed as a streaming (SSE) response.",
+	}, []string{"upstream"})
 )
 
 func init() {
@@ -151,5 +159,6 @@ func init() {
 		BulkheadRejectedTotal,
 		LegacySessionReusedTotal,
 		LegacySessionCreatedTotal,
+		StreamingResponsesTotal,
 	)
 }

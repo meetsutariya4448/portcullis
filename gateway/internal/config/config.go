@@ -229,9 +229,13 @@ type Upstream struct {
 	Namespace       string `yaml:"namespace"`
 	URL             string `yaml:"url"`
 	ProtocolVersion string `yaml:"protocol_version"`
-	// Timeout is the per-upstream HTTP client timeout. Optional; defaults to
-	// defaultUpstreamTimeout if empty. Accepts any value time.ParseDuration
-	// understands, e.g. "30s".
+	// Timeout bounds how long Portcullis waits for this upstream to start
+	// responding (Transport.ResponseHeaderTimeout) — NOT the whole
+	// request/response cycle. A response that starts within Timeout,
+	// including a long-lived streaming one, is then bounded only by the
+	// client's own connection lifetime, not by this value. Optional;
+	// defaults to defaultUpstreamTimeout if empty. Accepts any value
+	// time.ParseDuration understands, e.g. "30s".
 	Timeout string `yaml:"timeout"`
 	// MaxPoolSize overrides translate.DefaultMaxPoolSize for this upstream's
 	// legacy session pool (only meaningful when ProtocolVersion is
