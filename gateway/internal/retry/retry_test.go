@@ -75,6 +75,57 @@ func TestDo_NonRetryableStopsImmediately(t *testing.T) {
 	}
 }
 
+func TestDo_SkipTargetStopsImmediately(t *testing.T) {
+	calls := 0
+	err := Do(context.Background(), fastConfig(), func(attempt int) error {
+		calls++
+		return SkipTarget(errBoom)
+	})
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("expected errBoom (unwrapped via errors.Is), got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 call for a SkipTarget error, got %d", calls)
+	}
+}
+
+func TestSafeToRetryElsewhere(t *testing.T) {
+	if !SafeToRetryElsewhere(errBoom) {
+		t.Error("expected a bare error to be safe to retry elsewhere")
+	}
+	if !SafeToRetryElsewhere(SkipTarget(errBoom)) {
+		t.Error("expected a SkipTarget error to be safe to retry elsewhere")
+	}
+	if SafeToRetryElsewhere(NonRetryable(errBoom)) {
+		t.Error("expected a NonRetryable error to NOT be safe to retry elsewhere")
+	}
+}
+
+// TestSafeToRetryElsewhere_SeesThroughDosReturnValue proves the property
+// SafeToRetryElsewhere actually needs to hold: after a NonRetryable
+// failure propagates all the way through Do, the wrapper survives (Do no
+// longer manually unwraps it) so a failover caller can still classify it
+// correctly, while errors.Is against the original cause keeps working
+// for everyone else.
+func TestSafeToRetryElsewhere_SeesThroughDosReturnValue(t *testing.T) {
+	err := Do(context.Background(), fastConfig(), func(attempt int) error {
+		return NonRetryable(errBoom)
+	})
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("expected errors.Is to still see errBoom through Do's return value, got %v", err)
+	}
+	if SafeToRetryElsewhere(err) {
+		t.Fatal("expected Do's returned NonRetryable error to still read as unsafe elsewhere")
+	}
+
+	skipErr := Do(context.Background(), fastConfig(), func(attempt int) error {
+		return SkipTarget(errBoom)
+	})
+	if !SafeToRetryElsewhere(skipErr) {
+		t.Fatal("expected Do's returned SkipTarget error to still read as safe elsewhere")
+	}
+}
+
 func TestDo_MaxAttemptsOneNeverRetries(t *testing.T) {
 	calls := 0
 	err := Do(context.Background(), Config{MaxAttempts: 1, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}, func(attempt int) error {

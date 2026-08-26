@@ -9,6 +9,12 @@
 // wrap everything else in NonRetryable. See the call sites in
 // internal/server and internal/translate for the actual safety-boundary
 // reasoning (MCP tool calls are not guaranteed idempotent).
+//
+// A caller that layers failover on top of Do — retrying a DIFFERENT
+// target after Do gives up on the current one — has a second, related
+// question to answer: was this failure provably local (safe to attempt
+// elsewhere), or did it possibly reach the far side (unsafe anywhere)?
+// SkipTarget and SafeToRetryElsewhere answer that; see their doc comments.
 package retry
 
 import (
@@ -34,22 +40,60 @@ var DefaultConfig = Config{
 	MaxDelay:    200 * time.Millisecond,
 }
 
-// nonRetryable marks an error as unsafe to retry regardless of remaining
-// attempts.
-type nonRetryable struct{ err error }
+// nonRetryable marks an error as unsafe to retry against the current
+// target — Do stops immediately regardless of remaining attempts.
+// unsafeElsewhere additionally distinguishes whether the underlying
+// operation may have reached the far side (true — genuinely unsafe to
+// attempt against ANY target, the original retry-safety boundary) from a
+// failure that's provably local, such as an already-open circuit
+// breaker (false — safe for a caller building failover on top of Do to
+// try a different target). See NonRetryable vs SkipTarget.
+type nonRetryable struct {
+	err             error
+	unsafeElsewhere bool
+}
 
 func (n nonRetryable) Error() string { return n.err.Error() }
 func (n nonRetryable) Unwrap() error { return n.err }
 
 // NonRetryable wraps err to tell Do to return it immediately without
-// consuming further attempts. Do unwraps it before returning, so callers
-// downstream of Do never see the wrapper — errors.Is/As against the
-// original error still works.
+// consuming further attempts, AND to tell a failover caller (one that
+// tries a different target after Do gives up) that this failure may have
+// reached the far side — the operation might have already executed, so
+// no other target should be attempted either. errors.Is/As against the
+// original err still works through the wrapper's Unwrap.
 func NonRetryable(err error) error {
 	if err == nil {
 		return nil
 	}
-	return nonRetryable{err}
+	return nonRetryable{err: err, unsafeElsewhere: true}
+}
+
+// SkipTarget wraps err the same way NonRetryable does for Do's purposes
+// (stop immediately, no further attempts against the current target) but
+// marks it as safe to attempt against a DIFFERENT target — for a failure
+// that's provably local and never touched the network: a circuit breaker
+// already open, or a request that failed to even build. Distinct from
+// NonRetryable, which means the operation may have reached the far side
+// and is therefore unsafe anywhere.
+func SkipTarget(err error) error {
+	if err == nil {
+		return nil
+	}
+	return nonRetryable{err: err, unsafeElsewhere: false}
+}
+
+// SafeToRetryElsewhere reports whether err, as returned by Do, permits a
+// caller to attempt a different target. True for a bare error (Do
+// exhausted MaxAttempts on failures that were always safe to retry) or a
+// SkipTarget error; false only for a NonRetryable error, since the
+// underlying operation may have reached the far side.
+func SafeToRetryElsewhere(err error) bool {
+	var nr nonRetryable
+	if errors.As(err, &nr) {
+		return !nr.unsafeElsewhere
+	}
+	return true
 }
 
 // Do calls fn up to cfg.MaxAttempts times (an unset or <1 MaxAttempts
@@ -82,7 +126,7 @@ func Do(ctx context.Context, cfg Config, fn func(attempt int) error) error {
 		}
 		var nr nonRetryable
 		if errors.As(err, &nr) {
-			return nr.err
+			return nr
 		}
 		lastErr = err
 

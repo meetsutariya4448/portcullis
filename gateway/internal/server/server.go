@@ -374,13 +374,18 @@ func (s *Server) forward(ctx context.Context, upstream *router.Upstream, body []
 // handed to the upstream is wrapped in retry.NonRetryable.
 func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, body []byte, headers http.Header) (*http.Response, error) {
 	if !upstream.Breaker.Allow() {
-		return nil, retry.NonRetryable(translate.ErrCircuitOpen)
+		// Never touched the network -- retrying THIS backend is pointless
+		// (the breaker will still be open), but a failover caller may
+		// safely attempt a different backend.
+		return nil, retry.SkipTarget(translate.ErrCircuitOpen)
 	}
 
 	waitStart := time.Now()
 	if err := upstream.Bulkhead.Acquire(ctx); err != nil {
 		metrics.BulkheadRejectedTotal.WithLabelValues(upstream.Name).Inc()
-		return nil, retry.NonRetryable(err)
+		// A canceled wait for a bulkhead slot never touched the network
+		// either -- same reasoning as the breaker-open case above.
+		return nil, retry.SkipTarget(err)
 	}
 	metrics.BulkheadWaitSeconds.WithLabelValues(upstream.Name).Observe(time.Since(waitStart).Seconds())
 	metrics.BulkheadInflight.WithLabelValues(upstream.Name).Inc()
@@ -393,7 +398,10 @@ func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, b
 	outReq, err := http.NewRequestWithContext(probeCtx, http.MethodPost, upstream.URL, bytes.NewReader(body))
 	if err != nil {
 		upstream.Breaker.Record(false)
-		return nil, retry.NonRetryable(err)
+		// Building the request failed before anything was sent -- safe
+		// to attempt a different backend, unlike the two NonRetryable
+		// cases below where the request may have actually reached one.
+		return nil, retry.SkipTarget(err)
 	}
 	copyHeaders(outReq.Header, headers)
 

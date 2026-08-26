@@ -125,7 +125,10 @@ func (p *Pool) Forward(ctx context.Context, body []byte) (*http.Response, error)
 	if err != nil {
 		p.breaker.Record(false)
 		p.discardSession()
-		return nil, retry.NonRetryable(fmt.Errorf("building legacy request: %w", err))
+		// Building the request failed before anything was sent -- safe
+		// to attempt a different backend, unlike the NonRetryable cases
+		// below where the request may have actually reached the upstream.
+		return nil, retry.SkipTarget(fmt.Errorf("building legacy request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
