@@ -325,6 +325,15 @@ probe, with response bodies): `bench/.raw/chaos-timeline.log`.
 
 ### AI scanner (control plane) latency and cost
 
+> **Superseded.** The figures in this subsection came from eval harness v1,
+> which blended two layer-2 index configurations inside every reported
+> precision/recall pair (see the banner at the top of
+> `control/evals/REPORT.md`). They also came from a different harness on a
+> different date than the gateway numbers above, under this document's
+> "machine-specific" header — so they were never comparable with them
+> either. Do not quote them. The eval harness now fingerprints every run;
+> a re-run under it is pending `ANTHROPIC_API_KEY`.
+
 Already measured, sourced, and reported in full in
 [`control/evals/REPORT.md`](../control/evals/REPORT.md) — not re-run
 here, since doing so would mean fresh Anthropic API spend to reproduce

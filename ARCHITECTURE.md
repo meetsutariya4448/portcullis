@@ -14,10 +14,13 @@ onto the client. See [SPEC-NOTES.md](SPEC-NOTES.md) for the protocol
 details this is built against, all sourced from the published spec.
 
 The system is split into two independently-versioned pieces — see
-[CLAUDE.md](CLAUDE.md) for the "why Go / why Python" reasoning — and, as of
-this writing, they do not call each other: the control plane's scanner is a
-standalone, independently-evaluable component, not a dependency the data
-plane calls on the request path.
+[CLAUDE.md](CLAUDE.md) for the "why Go / why Python" reasoning. They still
+do not call each other: the two halves are joined by a **shared Postgres
+database**, not by an RPC. The gateway reads verdicts and writes a scan
+queue; the control plane reads that queue and writes verdicts. This keeps
+the scanner off the request path entirely — a ~3s layer-3 call can never
+land on a request the gateway is holding open — while making its verdicts
+enforceable. See **Tool-poisoning admission** below.
 
 ## Data Plane
 
@@ -110,14 +113,54 @@ one. See `control/scanner/cascade.py` for the orchestration and
    this layer: an unfalsifiable "trust me" verdict is worse than no
    verdict.
 
-**Not currently invoked by the data plane.** There is no HTTP service
-wrapping the cascade and nothing in `gateway/` calls out to it — it's
-exercised today via its own test suite (`control/scanner/tests/`) and the
+**Invoked out of band, never on the request path.** `control/app/worker.py`
+drains the `scan_queue` table the gateway writes, runs `Cascade.classify`
+unchanged, and writes rows to `tool_verdicts`. It is also exercised by its
+own test suite (`control/scanner/tests/`, `control/app/tests/`) and the
 offline eval harness (`control/evals/run_eval.py`) against a labeled
 corpus (`control/evals/corpus/`, provenance in
-`control/evals/corpus/README.md`). Wiring it into the live gateway request
-path (and building an actual policy-enforcement layer on top of a
-verdict — allow/block/log — which also doesn't exist yet) is future work.
+`control/evals/corpus/README.md`).
+
+Layer 2's production index is seeded from the corpus's **train split only**,
+via the same `control/evals/split.py` the eval harness uses — so the
+published held-out quality numbers describe the classifier that is actually
+running, not a differently-indexed one.
+
+## Tool-poisoning admission
+
+`gateway/internal/admission`, Go. Three pieces:
+
+- **Discoverer** — on startup and every `refresh_interval`, calls
+  `tools/list` against each native upstream on the gateway's own behalf
+  (SPEC-NOTES.md §1 prescribes exactly this: "once per upstream at
+  startup/config-load, not per client request"), hashes every
+  `(name, description, inputSchema)`, and replaces that namespace's catalog
+  entries. Definitions that are new or whose hash changed are enqueued for
+  scanning. **This is the rug-pull detector**, and `refresh_interval` is its
+  detection latency.
+- **Catalog** — the discovered tools, indexed by `{namespace}.{tool}`. It
+  exists because a `tools/call` body carries no description at all
+  (SPEC-NOTES.md §3): without an out-of-band catalog there is nothing to
+  judge a call against.
+- **Gate** — the request-path decision: catalog lookup, verdict lookup
+  behind a bounded TTL cache, policy evaluation. No network call, no model
+  call. Placed in `handleMCP` after the policy gate and before routing, so a
+  denied call costs no routing work and the upstream is never contacted.
+
+Verdicts are keyed by `(namespace, tool_name, content_hash)` and rows are
+never updated in place, so a tool's verdict history falls out of the schema
+rather than needing to be recorded separately. The canonical form the hash
+covers is specified identically in `gateway/internal/admission/hash.go` and
+`control/app/hashing.py`, with shared golden vectors asserted from both
+languages — the failure mode that contract prevents (verdicts filed under
+keys the gateway never reads, so enforcement silently does nothing while
+every dashboard looks healthy) is invisible to any single-language test.
+
+`internal/admission` is the one place the data plane takes a non-stdlib
+dependency beyond its existing set: `jackc/pgx` for the verdict store. The
+alternative — an HTTP hop to the Python control plane on the request path —
+would put a Python process's availability and latency in front of every
+proxied call, which is what this whole design exists to avoid.
 
 ## Data Flow
 
@@ -146,8 +189,9 @@ No production deployment story yet — this section describes what actually
 exists, not a target architecture.
 
 - `docker-compose.yml` (repo root): a local dev stack — `postgres`
-  (`pgvector/pgvector:pg16`) and `redis`. Neither is actually exercised by
-  anything that runs today: layer 2's `PgVectorStore`
+  (`pgvector/pgvector:pg16`) and `redis`. Postgres is now exercised: it
+  holds the admission schema (`control/migrations/001_admission.sql`) that
+  joins the two halves. Layer 2's `PgVectorStore`
   (`control/scanner/layer2_similarity.py`) is real, working code for a
   pgvector-backed attack index, but every eval run so far
   (`control/evals/run_eval.py`) has used its in-memory store instead —

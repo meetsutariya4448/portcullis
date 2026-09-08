@@ -11,10 +11,16 @@ isolation, backpressure, graceful shutdown, gateway-edge auth, a
 `(client, namespace, tool)` policy engine, rate limiting, quotas,
 OpenTelemetry tracing, SSE streaming, and ordered upstream failover are
 all implemented and tested. The legacy-protocol translation shim and the
-three-layer tool-poisoning scanner are implemented and tested too. Two
-things are still explicitly **not** wired up — see
-[What's not implemented](#whats-not-implemented): the scanner's verdict
-isn't consumed by anything yet, and there's no production deployment
+three-layer tool-poisoning scanner are implemented and tested too, and the
+scanner's verdicts are now **enforced** by the gateway: a tool whose
+description the scanner classified as an attack is denied before the
+upstream is contacted, and a server that swaps a cleared description for a
+poisoned one is re-assessed rather than grandfathered. See
+[Tool-poisoning admission](#tool-poisoning-admission).
+
+What remains explicitly **not** done is listed under
+[What's not implemented](#whats-not-implemented) — most importantly, the
+`tools/list` filtering half of admission, and production deployment
 tooling.
 
 ## What's implemented
@@ -73,6 +79,15 @@ tooling.
   verified as a literal substring of the input description and rejected
   outright (never repaired) if it isn't. See
   [Measured results](#measured-results) below.
+- **Tool-poisoning admission** (`gateway/internal/admission`) — the
+  scanner's verdicts, enforced. A background discoverer lists each
+  upstream's tools, hashes every `(name, description, inputSchema)`, and
+  queues anything unscanned; the Python worker
+  (`control/app/worker.py`) runs the cascade out of band and writes
+  verdicts to Postgres. The request path does a cached lookup, never a
+  model call. Verdicts are keyed by content hash, so a changed description
+  is a different verdict — see
+  [Tool-poisoning admission](#tool-poisoning-admission).
 - **Test pyramid and live measurement** — `go test -race` as the
   standing bar since the first commit, Go native fuzz tests against
   every untrusted-input parser (protocol headers, JSON-RPC bodies,
@@ -90,14 +105,22 @@ recollection: [SPEC-NOTES.md](SPEC-NOTES.md).
 
 ## What's not implemented
 
-- **Scanner verdict isn't enforced anywhere.** The scanner produces a
-  verdict (`malicious`/`benign`/`uncertain`); nothing consumes it yet.
-  The gateway's own policy engine (above) authorizes calls by
-  client/namespace/tool — a separate, orthogonal concern from acting on
-  a scanner's tool-poisoning verdict, which nothing does yet.
-- **Scanner ↔ gateway integration.** The scanner is a standalone Python
-  component with its own test suite and eval harness — the Go gateway
-  does not call it. Nothing in `gateway/` references the scanner today.
+- **`tools/list` filtering.** Admission enforces at `tools/call`. The
+  listing half — serving a merged, verdict-filtered `tools/list` from the
+  discovery catalog — is designed but not built, and `tools/list` is still
+  unroutable through the gateway (`handleMCP` requires a
+  namespace-qualified `Mcp-Name` on every request, which the spec requires
+  only for `tools/call`/`resources/read`/`prompts/get`). Until that lands,
+  a poisoned description still reaches the client's model even though
+  calling the tool is blocked.
+- **Legacy upstreams are not discovered.** Tool discovery speaks
+  `2026-07-28` directly; reaching a `2025-11-25` upstream needs a
+  handshaken session from `internal/translate`. Legacy upstreams are
+  skipped explicitly rather than silently yielding an empty catalog, but
+  their tools are therefore never scanned.
+- **Per-principal listings.** The discoverer lists with the gateway's own
+  credentials, so a server that varies its tool list by authenticated
+  principal (permitted by SPEC-NOTES.md §2) is modelled as a single list.
 - **Production deployment.** `docker-compose.yml` is a local dev stack;
   there's no Kubernetes/Helm config, CI deploy pipeline, or image registry
   publishing.
@@ -117,8 +140,15 @@ cd gateway && go run ./cmd/portcullis -config config.example.yaml
 cd control && pip install -e . && python3 -m pytest scanner
 
 # Scanner eval against the labeled corpus (needs ANTHROPIC_API_KEY;
-# layer 2 runs locally, no key needed for that layer)
+# layer 2 runs locally, no key needed for that layer). Writes
+# evals/results/<fingerprint>/ and, for a full run, regenerates REPORT.md.
 cd control && python3 evals/run_eval.py
+cd control && python3 evals/run_eval.py --skip-llm   # local layers only
+
+# Tool-poisoning admission: schema, then the out-of-band scanning worker
+docker compose up -d postgres
+psql "$PORTCULLIS_ADMISSION_DATABASE_URL" -f control/migrations/001_admission.sql
+cd control && python3 -m app.run_worker --once   # or omit --once to poll
 
 # Gateway overhead benchmark (needs Docker + `hey`: brew install hey)
 ./bench/run_bench.sh
@@ -129,6 +159,84 @@ cd control && python3 evals/run_eval.py
 # Live-timed circuit-breaker recovery (stops/starts a real upstream container)
 ./bench/run_chaos_bench.sh
 ```
+
+## Tool-poisoning admission
+
+The scanner's verdicts decide which tools a client may call.
+
+**Nothing is scanned on the request path.** Layer 3 measures p50 ~3s; the
+gateway's own overhead budget is under a millisecond. So the work is split:
+
+```
+                 (out of band, every refresh_interval)
+gateway --tools/list--> upstream        gateway --enqueue--> scan_queue
+        <--definitions--                                          |
+        hash each (name, description, inputSchema)                |
+                                                        control/app/worker.py
+                                                          runs the cascade
+                                                                  |
+                                                           tool_verdicts
+                                                                  |
+client --tools/call--> gateway --cached lookup--> verdict --> allow | 403
+```
+
+The gateway reads `tool_verdicts`; the worker reads `scan_queue`. Neither
+process calls the other — the database is the entire interface
+(`control/migrations/001_admission.sql`).
+
+**Verdicts are keyed by content hash**, not by tool name. The hash covers
+the tool's name, description and input schema — everything a model reads —
+so a server that serves a benign description, gets cleared, then swaps in a
+poisoned one produces a *different* key and does not inherit the old
+verdict. Rows are never updated in place, so a tool's verdict history is
+just the rows sharing its name:
+
+```
+     hash     |  verdict  | produced_by
+--------------+-----------+-------------
+ 6e1cd9ed033a | benign    | layer2
+ db413fc7cbe1 | malicious | layer1        <- after the description was swapped
+```
+
+The canonical form the hash is taken over is specified identically in Go
+(`gateway/internal/admission/hash.go`) and Python
+(`control/app/hashing.py`), with shared golden vectors in
+[testdata/tool_hash_vectors.json](testdata/tool_hash_vectors.json) asserted
+from both. If they ever diverge the worker refuses to scan rather than
+filing a verdict under a key the gateway will never read.
+
+**Outcomes** (`admission:` in `gateway/config.example.yaml`):
+
+| Verdict | `tools/call` | Configurable |
+|---|---|---|
+| `benign` | allow | no |
+| `malicious` | **deny** (403, JSON-RPC `-32001`) | no |
+| `uncertain`, `layer3_failure` | deny | `on_uncertain` |
+| no verdict for the current hash | allow + warn | `on_unknown` |
+| verdict store unreachable | last-known verdict, else allow + error log | `on_unavailable` |
+
+`malicious` and `benign` are deliberately not configurable: an operator who
+wants monitor mode turns the gate off rather than configuring it into
+reporting enforcement it isn't doing. A scan that failed is never recorded
+as `benign` — an outage is not a clean bill of health.
+
+**Decision logs** carry the evidence needed to act on a denial: which tool,
+which exact content hash, which verdict and attack class, and the eval-run
+fingerprint that characterizes how good that judgement is.
+
+```sql
+ point | tool_name  | decision |    reason    |     hash     |  verdict  |   fingerprint
+-------+------------+----------+--------------+--------------+-----------+------------------
+ call  | summarize  | allow    | benign       | 6e1cd9ed033a | benign    | 6cdd4785936c4da9
+ call  | exfiltrate | deny     | malicious    | c14d8cd807d0 | malicious | 6cdd4785936c4da9
+ call  | summarize  | allow    | unknown_hash | db413fc7cbe1 |           |
+```
+
+Metrics: `portcullis_admission_decisions_total{point,outcome,reason,namespace}`,
+`portcullis_admission_latency_seconds{point}` (reported separately from the
+headline gateway overhead so the cost of enforcement stays falsifiable),
+`portcullis_admission_catalog_tools`, `portcullis_admission_scans_enqueued_total`,
+`portcullis_admission_discovery_failures_total`.
 
 ## Chaos demo
 
@@ -154,21 +262,42 @@ number out of context.
 methodology, per-attack-class breakdown, and cost in
 [control/evals/REPORT.md](control/evals/REPORT.md)):
 
-| | precision | recall | F1 |
-|---|---|---|---|
-| Layer 1 (rules) | 1.000 | 0.737 | 0.848 |
-| Layer 2 (embeddings, leave-one-out) | 1.000 | 0.947 | 0.973 |
-| Layer 3 (LLM) | 0.926 | 0.658 | 0.769 |
-| **Full cascade** | **1.000** | **0.947** | **0.973** |
+> **These figures are superseded and are not being restated here.** They
+> were produced by harness v1, which scored malicious rows against a
+> row- or family-excluded layer-2 index while scoring benign rows against
+> the *full* index — so precision and recall inside each row came from two
+> different configurations, and the F1 over them described neither. The
+> bolded "full cascade" row was additionally the leave-one-out
+> configuration without saying so, sitting beside a layer-3 row measured
+> under different conditions.
+>
+> The harness has been rebuilt around a held-out split
+> (`control/evals/split.py`): one layer-2 index, built from train-split
+> attacks only, and every number computed over held-out rows that are not
+> in it. Every run now carries a fingerprint over its corpus, split,
+> model, thresholds, embedder and library versions, and writes
+> machine-readable artifacts to `control/evals/results/<fingerprint>/`.
+>
+> **Re-running the full eval needs `ANTHROPIC_API_KEY` and has not been
+> done yet**, so no cascade or layer-3 figure is quoted above. The
+> local-only layers have been measured under the new configuration
+> (fingerprint `6cdd4785936c4da9`, marked `partial: true` because layer 3
+> was skipped):
+>
+> | | precision | recall | F1 | n (held-out) |
+> |---|---|---|---|---|
+> | Layer 1 (rules) | 1.000 | 0.850 | 0.919 | 62 |
+> | Layer 2 (embeddings, held-out index) | n/a (no positives) | 0.000 | n/a | 62 |
+>
+> Layer 2's held-out recall of **0.000** is the finding the old 0.947
+> concealed: against seed families absent from its index it retrieves
+> nothing, which the leave-one-seed-family-out diagnostic had already
+> hinted at. Quote a number from this project only together with the run
+> fingerprint it came from.
 
-Caveat that matters: layer 2's recall drops to **0.000** when the scored
-sample's entire seed family (not just itself) is excluded from the index —
-most of its apparent recall is retrieving a near-identical sibling, not
-generalizing to an unfamiliar attack. The cascade inherits this: recall
-falls to 0.842 under that stricter indexing, with detection shifting onto
-layers 1 and 3. Both numbers are reported side by side in REPORT.md, not
-just the flattering one. Cascade LLM invocation rate is 2.9% of rows
-(~$0.50 per 1,000 tools scanned) under the leave-one-out numbers above.
+The superseded harness-v1 report is still in
+[control/evals/REPORT.md](control/evals/REPORT.md) for provenance; it is
+labelled there rather than deleted.
 
 **Gateway overhead**, single instance, median of 3 warmed-up runs on an
 Apple M2 (8 cores) — full method and caveats in
