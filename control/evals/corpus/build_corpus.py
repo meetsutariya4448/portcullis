@@ -6,16 +6,27 @@
   - variants.jsonl         (malicious, derivation=variant_of:<seed_id> - see generate_variants.py)
 
 Writes corpus.jsonl with exactly the fields: id, name, description,
-input_schema, label, attack_class, source, derivation. Then prints the
-final count by label and by attack_class.
+input_schema, label, attack_class, source, derivation, split. Then prints
+the final count by label, by attack_class, and by split side.
+
+`split` is assigned by ../split.py -- a deterministic, group-wise
+train/held-out assignment computed from row identity alone. It is written
+into the corpus (rather than recomputed by each consumer) so that which
+side a row landed on is auditable in git, and so the eval harness and the
+control-plane worker cannot drift into disagreeing about it.
 """
 
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).parent
 OUT_PATH = HERE / "corpus.jsonl"
+
+sys.path.insert(0, str(HERE.parent))
+
+import split as split_module  # noqa: E402  (needs the sys.path line above)
 
 
 def load_jsonl(path):
@@ -72,6 +83,12 @@ def main():
             }
         )
 
+    # Assigned after every row exists, since the split is computed over
+    # whole groups (seed families / source hosts) rather than row by row.
+    assignment = split_module.assign(rows)
+    for r in rows:
+        r["split"] = assignment[r["id"]]
+
     with open(OUT_PATH, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
@@ -92,6 +109,9 @@ def main():
     print("\nBy derivation:")
     for kind, count in derivation_counts.items():
         print(f"  {kind}: {count}")
+
+    print(f"\nBy split ({split_module.SPLIT_SPEC}):")
+    print(split_module.summarize(rows))
 
 
 if __name__ == "__main__":
