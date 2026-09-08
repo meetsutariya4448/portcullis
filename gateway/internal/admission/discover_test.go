@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -182,23 +184,63 @@ func TestDiscoverer_ReportsAnUpstreamError(t *testing.T) {
 	}
 }
 
-func TestDiscoverer_SkipsLegacyUpstreams(t *testing.T) {
-	// Legacy upstreams need a handshaken session from translate.Pool to
-	// reach; silently discovering nothing for them would leave a whole
-	// protocol version unscanned while appearing to work.
-	var body atomic.Value
-	body.Store(listBody(toolJSON("summarize", "Summarize.")))
-	upstream, calls := listingUpstream(t, &body)
-	upstream.ProtocolVersion = "2025-11-25"
-	discoverer, gate, _ := newDiscoverer(t, upstream)
+// fakeLegacyPool stands in for translate.Pool: it owns the handshake and
+// session in production, so discovery only ever hands it a body.
+type fakeLegacyPool struct {
+	body  string
+	calls atomic.Int32
+	got   []byte
+}
+
+func (f *fakeLegacyPool) Forward(_ context.Context, body []byte) (*http.Response, error) {
+	f.calls.Add(1)
+	f.got = append([]byte(nil), body...)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(f.body)),
+	}, nil
+}
+
+func TestDiscoverer_DiscoversLegacyUpstreamsThroughTheSessionPool(t *testing.T) {
+	// Legacy upstreams were skipped entirely, so a whole protocol version
+	// went unscanned while the gateway happily proxied calls to it.
+	pool := &fakeLegacyPool{body: listBody(toolJSON("summarize", "Summarize."))}
+	upstream := Upstream{
+		Name: "legacy-upstream", Namespace: "legacy",
+		URL: "http://unused", ProtocolVersion: "2025-11-25", LegacyPool: pool,
+	}
+	discoverer, gate, store := newDiscoverer(t, upstream)
 
 	discoverer.RefreshAll(context.Background())
 
-	if calls.Load() != 0 {
-		t.Errorf("a legacy upstream was listed %d times, want 0", calls.Load())
+	if pool.calls.Load() != 1 {
+		t.Fatalf("legacy pool was called %d times, want 1", pool.calls.Load())
 	}
-	if gate.Catalog().Len() != 0 {
-		t.Error("a legacy upstream contributed catalog entries")
+	if _, ok := gate.Catalog().Lookup("legacy.summarize"); !ok {
+		t.Fatal("a legacy upstream's tools did not reach the catalog")
+	}
+	if len(store.Queued()) != 1 {
+		t.Errorf("queued %d legacy definitions for scanning, want 1", len(store.Queued()))
+	}
+}
+
+func TestDiscoverer_DoesNotSendModernMetaToALegacyUpstream(t *testing.T) {
+	// protocolVersion in _meta is a 2026-07-28 field; a 2025-11-25 server
+	// negotiated its version during the pool's handshake and never defined
+	// that key.
+	pool := &fakeLegacyPool{body: listBody(toolJSON("summarize", "Summarize."))}
+	upstream := Upstream{
+		Name: "legacy-upstream", Namespace: "legacy",
+		URL: "http://unused", ProtocolVersion: "2025-11-25", LegacyPool: pool,
+	}
+	discoverer, _, _ := newDiscoverer(t, upstream)
+
+	if err := discoverer.Refresh(context.Background(), upstream); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if strings.Contains(string(pool.got), "protocolVersion") {
+		t.Errorf("a modern _meta field was sent to a legacy upstream: %s", pool.got)
 	}
 }
 

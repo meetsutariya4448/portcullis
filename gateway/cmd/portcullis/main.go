@@ -284,13 +284,20 @@ func buildAdmission(ctx context.Context, cfg *config.Config, rtr *router.Router,
 
 	upstreams := make([]admission.Upstream, 0, len(rtr.All()))
 	for _, u := range rtr.All() {
-		upstreams = append(upstreams, admission.Upstream{
+		entry := admission.Upstream{
 			Name:            u.Name,
 			Namespace:       u.Namespace,
 			URL:             u.URL,
 			Client:          u.Client,
 			ProtocolVersion: u.ProtocolVersion,
-		})
+		}
+		// Assigned only when non-nil: a typed nil *translate.Pool stored in
+		// an interface field is not == nil, which would send every native
+		// upstream down the legacy path.
+		if u.LegacyPool != nil {
+			entry.LegacyPool = u.LegacyPool
+		}
+		upstreams = append(upstreams, entry)
 	}
 
 	discoverer := admission.NewDiscoverer(upstreams, gate, log, refreshInterval)

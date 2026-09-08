@@ -31,13 +31,21 @@ type Upstream struct {
 	Namespace string
 	URL       string
 	Client    *http.Client
-	// ProtocolVersion is the upstream's configured MCP revision. Legacy
-	// (2025-11-25) upstreams are skipped: reaching them requires a
-	// handshaken session from translate.Pool, and their listings carry no
-	// ttlMs/cacheScope (SPEC-NOTES.md:433-437). Discovering them is a
-	// separate piece of work, and pretending otherwise would silently leave
-	// a whole protocol version unscanned.
+	// ProtocolVersion is the upstream's configured MCP revision.
 	ProtocolVersion string
+	// LegacyPool forwards over a handshaken 2025-11-25 session, and is set
+	// only for legacy upstreams. Reaching one needs a session the pool owns,
+	// so discovery goes through it rather than building its own request.
+	//
+	// An interface rather than a *translate.Pool so this package does not
+	// depend on internal/translate, and so tests can drive the legacy path
+	// without a handshake.
+	LegacyPool LegacyForwarder
+}
+
+// LegacyForwarder is the part of translate.Pool discovery needs.
+type LegacyForwarder interface {
+	Forward(ctx context.Context, body []byte) (*http.Response, error)
 }
 
 // Discoverer keeps the catalog current by periodically listing each
@@ -103,9 +111,6 @@ func (d *Discoverer) Run(ctx context.Context) {
 func (d *Discoverer) RefreshAll(ctx context.Context) {
 	var wg sync.WaitGroup
 	for _, upstream := range d.upstreams {
-		if upstream.ProtocolVersion != "" && upstream.ProtocolVersion != NativeProtocolVersion {
-			continue
-		}
 		wg.Add(1)
 		go func(u Upstream) {
 			defer wg.Done()
@@ -197,25 +202,17 @@ type listResult struct {
 func (d *Discoverer) listTools(ctx context.Context, upstream Upstream) ([]listedTool, error) {
 	var all []listedTool
 	cursor := ""
+	legacy := upstream.LegacyPool != nil
 
 	for page := 0; page < maxListPages; page++ {
-		body, err := d.buildListRequest(cursor)
+		body, err := d.buildListRequest(cursor, legacy)
 		if err != nil {
 			return nil, err
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream.URL, bytes.NewReader(body))
+		resp, err := d.postList(ctx, upstream, body, legacy)
 		if err != nil {
-			return nil, fmt.Errorf("building tools/list request: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		req.Header.Set("MCP-Protocol-Version", d.protocolVersion)
-		req.Header.Set("Mcp-Method", "tools/list")
-
-		resp, err := upstream.Client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("tools/list request failed: %w", err)
+			return nil, err
 		}
 
 		payload, err := io.ReadAll(io.LimitReader(resp.Body, maxListResponseBytes))
@@ -244,13 +241,47 @@ func (d *Discoverer) listTools(ctx context.Context, upstream Upstream) ([]listed
 	return nil, fmt.Errorf("tools/list did not terminate within %d pages", maxListPages)
 }
 
-func (d *Discoverer) buildListRequest(cursor string) ([]byte, error) {
-	params := map[string]any{
-		// Every outbound call must carry the protocol version in _meta as
-		// well as the header, and the two must agree (SPEC-NOTES.md §1/§3).
-		"_meta": map[string]any{
+// postList issues one tools/list page, over the legacy session pool when
+// the upstream speaks 2025-11-25 and directly otherwise.
+func (d *Discoverer) postList(ctx context.Context, upstream Upstream, body []byte, legacy bool) (*http.Response, error) {
+	if legacy {
+		// The pool owns the handshake and the Mcp-Session-Id, and sets the
+		// headers a 2025-11-25 server expects. Discovery just hands it a
+		// body, exactly as the proxy path does.
+		resp, err := upstream.LegacyPool.Forward(ctx, body)
+		if err != nil {
+			return nil, fmt.Errorf("legacy tools/list failed: %w", err)
+		}
+		return resp, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream.URL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("building tools/list request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", d.protocolVersion)
+	req.Header.Set("Mcp-Method", "tools/list")
+
+	resp, err := upstream.Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("tools/list request failed: %w", err)
+	}
+	return resp, nil
+}
+
+func (d *Discoverer) buildListRequest(cursor string, legacy bool) ([]byte, error) {
+	params := map[string]any{}
+	if !legacy {
+		// Every outbound 2026-07-28 call must carry the protocol version in
+		// _meta as well as the header, and the two must agree
+		// (SPEC-NOTES.md §1/§3). A 2025-11-25 server predates that field and
+		// negotiated its version during the pool's handshake, so sending it
+		// there would be inventing a field the server never defined.
+		params["_meta"] = map[string]any{
 			"io.modelcontextprotocol/protocolVersion": d.protocolVersion,
-		},
+		}
 	}
 	if cursor != "" {
 		params["cursor"] = cursor
