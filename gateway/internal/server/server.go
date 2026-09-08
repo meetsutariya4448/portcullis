@@ -22,6 +22,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/meetsutariya4448/portcullis/gateway/internal/admission"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/auth"
 	gwmcp "github.com/meetsutariya4448/portcullis/gateway/internal/mcp"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
@@ -36,6 +37,20 @@ import (
 // maxBodyBytes bounds how much of a request body Portcullis will read into
 // memory before rejecting the request.
 const maxBodyBytes = 10 << 20 // 10MiB
+
+// toolCallMethod is the only method the admission gate applies to on the
+// proxy path. resources/read and prompts/get are also name-bearing, but a
+// tool-poisoning verdict is about a tool definition specifically; extending
+// enforcement to them would need verdicts keyed by resource/prompt, which
+// the scanner does not produce.
+const toolCallMethod = "tools/call"
+
+// toolPoisoningDeniedCode is the JSON-RPC error code for a call blocked by
+// a scanner verdict. In the implementation-defined server-error range
+// (-32000 to -32099) and distinct from the generic -32000 used for other
+// gateway errors, so a client can tell "this tool is quarantined" from
+// "the gateway had a problem" without string-matching the message.
+const toolPoisoningDeniedCode = -32001
 
 // apiKeyHeader carries the gateway-edge API key. Deliberately not
 // "Authorization": that header (if a client sends one) is meant for the
@@ -80,6 +95,10 @@ type Options struct {
 	// QuotaTracker is optional. nil means no client is ever quota-limited
 	// — today's behavior, unchanged, for a config with no quota: block.
 	QuotaTracker *quota.Tracker
+	// Admission is optional. nil means tool-poisoning verdicts are never
+	// consulted and every tool is admitted — today's behavior, unchanged,
+	// for a config with no admission: block.
+	Admission *admission.Gate
 }
 
 // Server holds the dependencies shared by all handlers.
@@ -91,6 +110,7 @@ type Server struct {
 	policy        *policy.Policy
 	rateLimiter   *ratelimit.Limiter
 	quotaTracker  *quota.Tracker
+	admission     *admission.Gate
 
 	// inflightSem bounds total concurrent /mcp handling gateway-wide —
 	// backpressure. A request that can't immediately acquire a slot is
@@ -112,6 +132,7 @@ func New(opts Options) *Server {
 		policy:        opts.Policy,
 		rateLimiter:   opts.RateLimiter,
 		quotaTracker:  opts.QuotaTracker,
+		admission:     opts.Admission,
 		inflightSem:   make(chan struct{}, maxInflight),
 	}
 	s.mux.HandleFunc("POST /mcp", s.handleMCP)
@@ -270,6 +291,32 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		metrics.PolicyDeniedTotal.WithLabelValues(clientID, namespace).Inc()
 		s.writeGatewayError(w, r, req.Method, headers.Name, http.StatusForbidden, req.ID, reason, handlerStart, nil)
 		return
+	}
+
+	// Tool-poisoning admission. Placed after the policy gate and before
+	// Resolve for the same reason policy is: the decision is made from the
+	// request's own namespace/tool, so a denied call costs no routing or
+	// upstream work and -- critically -- the upstream is never contacted.
+	//
+	// This is a lookup against an out-of-band-populated catalog and verdict
+	// cache, not a scanner call. Its cost is recorded on its own histogram
+	// so it stays separable from the headline gateway-overhead figure.
+	if s.admission != nil && req.Method == toolCallMethod {
+		admissionStart := time.Now()
+		decision := s.admission.AdmitCall(r.Context(), clientID, headers.Name)
+		metrics.AdmissionLatency.WithLabelValues(string(admission.PointCall)).Observe(time.Since(admissionStart).Seconds())
+		metrics.AdmissionDecisionsTotal.WithLabelValues(
+			string(admission.PointCall), string(decision.Outcome), string(decision.Reason), namespace,
+		).Inc()
+		span.SetAttributes(
+			attribute.String("portcullis.admission.outcome", string(decision.Outcome)),
+			attribute.String("portcullis.admission.reason", string(decision.Reason)),
+			attribute.String("portcullis.admission.content_hash", decision.ContentHash),
+		)
+		if decision.Denied() {
+			s.writeToolPoisoningDenial(w, r, req.Method, headers.Name, req.ID, decision, handlerStart)
+			return
+		}
 	}
 
 	group, err := s.router.Resolve(namespace)
@@ -494,6 +541,60 @@ func (s *Server) writeJSONRPCError(w http.ResponseWriter, r *http.Request, metho
 		"error_message", resp.Error.Message,
 	}, traceLogArgs(r.Context())...)
 	s.log.Warn("mcp request rejected", logArgs...)
+}
+
+// writeToolPoisoningDenial rejects a call blocked by a scanner verdict.
+//
+// The response deliberately does not include the evidence span or the
+// poisoned text: the client's model is the thing being protected from that
+// text, and echoing it back in an error message would hand over exactly
+// what the gate just withheld. The content hash is included so an operator
+// can join the rejection to the decision log and the verdict row, where the
+// full evidence lives.
+func (s *Server) writeToolPoisoningDenial(w http.ResponseWriter, r *http.Request, method, tool string, id json.RawMessage, decision admission.Decision, handlerStart time.Time) {
+	message := "tool call denied by tool-poisoning policy"
+	switch decision.Reason {
+	case admission.ReasonMalicious:
+		message = "tool denied: its current description was classified as a tool-poisoning attack"
+	case admission.ReasonUncertain, admission.ReasonScanFailed:
+		message = "tool denied: its current description has no conclusive scanner verdict"
+	case admission.ReasonUnknownHash, admission.ReasonUndiscovered:
+		message = "tool denied: its current description has not been scanned"
+	case admission.ReasonUnavailable:
+		message = "tool denied: the verdict store is unavailable and policy is fail-closed"
+	}
+
+	resp := gwmcp.ErrorResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: gwmcp.RPCError{
+			Code:    toolPoisoningDeniedCode,
+			Message: message,
+		},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(resp)
+
+	span := trace.SpanFromContext(r.Context())
+	span.SetAttributes(semconv.HTTPResponseStatusCode(http.StatusForbidden))
+	span.SetStatus(codes.Error, message)
+
+	duration := time.Since(handlerStart)
+	status := strconv.Itoa(http.StatusForbidden)
+	metrics.RequestsTotal.WithLabelValues(method, tool, status).Inc()
+	metrics.GatewayLatency.WithLabelValues(method, tool, status).Observe(duration.Seconds())
+	// The decision itself is logged by the admission gate, with the full
+	// verdict provenance; this line records the HTTP outcome.
+	s.log.Warn("mcp request denied by tool-poisoning admission",
+		append([]any{
+			"method", method,
+			"tool", tool,
+			"duration_ms", duration.Milliseconds(),
+			"status", http.StatusForbidden,
+			"reason", string(decision.Reason),
+			"content_hash", decision.ContentHash,
+		}, traceLogArgs(r.Context())...)...)
 }
 
 // writeGatewayError writes a generic JSON-RPC error response for failures
