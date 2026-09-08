@@ -98,6 +98,58 @@ var (
 		Help: "Total requests rejected because the client exceeded its quota.",
 	}, []string{"client"})
 
+	// AdmissionDecisionsTotal counts tool-poisoning admission decisions by
+	// enforcement point (list/call), outcome (allow/deny) and reason.
+	//
+	// Labeled by namespace rather than by tool: tool names come from
+	// upstream servers and are unbounded, so using one as a label value
+	// would let an upstream grow this metric without limit. Same reasoning
+	// as PolicyDeniedTotal above.
+	AdmissionDecisionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_admission_decisions_total",
+		Help: "Tool-poisoning admission decisions, by enforcement point, outcome and reason.",
+	}, []string{"point", "outcome", "reason", "namespace"})
+
+	// AdmissionLatency measures the admission gate's own cost: catalog
+	// lookup plus verdict lookup, which is a cache hit in the steady state.
+	//
+	// Reported separately from GatewayLatency so the claim that enforcement
+	// is effectively free stays falsifiable -- the added cost is visible on
+	// its own rather than folded into the headline overhead figure.
+	AdmissionLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "portcullis_admission_latency_seconds",
+		Help: "Time spent in the tool-poisoning admission gate, per request.",
+		// Finer-grained than DefBuckets at the low end: a cache hit should
+		// land in microseconds, and DefBuckets' 5ms floor would hide the
+		// difference between "free" and "not free".
+		Buckets: []float64{0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5},
+	}, []string{"point"})
+
+	// AdmissionCatalogTools is the number of tools currently discovered
+	// from upstream listings, per namespace. A namespace that drops to zero
+	// means discovery is failing for that upstream.
+	AdmissionCatalogTools = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "portcullis_admission_catalog_tools",
+		Help: "Tools currently discovered from upstream listings, per namespace.",
+	}, []string{"namespace"})
+
+	// AdmissionScansEnqueuedTotal counts tool definitions queued for the
+	// control plane to scan. A persistently rising counter alongside a
+	// rising unknown_hash decision count means the worker is not keeping up
+	// (or is not running).
+	AdmissionScansEnqueuedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_admission_scans_enqueued_total",
+		Help: "Tool definitions enqueued for out-of-band scanning, per namespace.",
+	}, []string{"namespace"})
+
+	// AdmissionDiscoveryFailuresTotal counts failed upstream tool-list
+	// refreshes. While this rises, the catalog is going stale and a
+	// rug-pull would go unnoticed.
+	AdmissionDiscoveryFailuresTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "portcullis_admission_discovery_failures_total",
+		Help: "Failed upstream tool-list discovery refreshes, per namespace.",
+	}, []string{"namespace"})
+
 	// UpstreamLatency measures pure upstream round-trip time — the
 	// forward() call's duration, excluding Portcullis's own header
 	// parsing/routing/marshaling overhead (that's GatewayLatency's job).
@@ -163,6 +215,11 @@ func init() {
 		PolicyDeniedTotal,
 		RateLimitRejectedTotal,
 		QuotaRejectedTotal,
+		AdmissionDecisionsTotal,
+		AdmissionLatency,
+		AdmissionCatalogTools,
+		AdmissionScansEnqueuedTotal,
+		AdmissionDiscoveryFailuresTotal,
 		UpstreamLatency,
 		BulkheadRejectedTotal,
 		LegacySessionReusedTotal,
