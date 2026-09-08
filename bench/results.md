@@ -357,3 +357,89 @@ picking the more flattering number), per-layer breakdowns, and the full
 methodology.
 
 **These numbers are machine-specific.** Re-run on your own hardware before drawing conclusions.
+
+---
+
+# Tool-poisoning admission overhead
+
+Generated: 2026-09-07 (local processes, see the methodology note below)
+Produced by [`bench/run_admission_bench.sh`](run_admission_bench.sh).
+
+**Appended, not a replacement** — same standing rule as the sections above.
+
+## Why this exists
+
+The design claim under test is that enforcing scanner verdicts costs
+essentially nothing on the request path, because the gateway does a cached
+lookup rather than a model call. Layer 3 measures seconds per call; the
+gateway's whole overhead budget is under a millisecond. That claim is only
+worth making with a number attached, and this is the number.
+
+## Method — and how it differs from the sections above
+
+Unlike Milestone 1 and 6, this runs **local processes, not CPU-limited
+containers**. The quantity of interest is a within-run A/B: three arms
+share the same binary, the same upstream, the same machine and the same
+load generator, and differ only in the `admission:` config block. The delta
+between arms is therefore meaningful even though the absolute latencies
+are **not comparable** with the containerised numbers above. Do not read
+the 2.3ms baseline here against the 6.3ms baseline in Milestone 1.
+
+- `hey -n 3000 -c 25`, 300-request warmup discarded, **median of 3**
+- Apple M1 Pro, 10 cores, macOS 26.6.2
+- Upstream: a local native `2026-07-28` server with 25 benign tools
+- Verdict store: local PostgreSQL 15, schema from `control/migrations/001_admission.sql`
+
+Three arms:
+
+| arm | meaning |
+|---|---|
+| `off` | no `admission:` block — behaviour before the feature existed |
+| `warm` | admission on, `cache_ttl: 30s`, verdict served from the in-process cache |
+| `cold` | admission on, `cache_ttl: 1ns` — every request re-reads Postgres |
+
+`cold` is a deliberately pathological floor, not a configuration anyone
+should run. It exists to bound the worst case: what admission costs if the
+cache never helps at all.
+
+## Results
+
+| arm | p50 | p95 | rps | non-200 |
+|---|---:|---:|---:|---|
+| off | 2.30ms | 7.00ms | 8035 | none |
+| warm | 2.50ms | 7.30ms | 7812 | none |
+| cold | 2.60ms | 7.60ms | 7458 | none |
+
+Added p50 vs. `off`: **+0.20ms warm, +0.30ms cold**.
+
+A second full run of the same script gave 2.40 / 2.50 / 2.60ms — so the
+warm-cache delta is **at the edge of what this harness can resolve**, and
+should be read as "under a few tenths of a millisecond", not as a precise
+0.2ms. The `off` arm alone moved 0.1ms between runs.
+
+The gate's own histogram is the more precise measurement, and it was taken
+from the **cache-disabled** arm — the worst case:
+
+```
+portcullis_admission_latency_seconds_sum{point="call"}   1.578
+portcullis_admission_latency_seconds_count{point="call"} 9300
+portcullis_admission_latency_seconds_bucket{point="call",le="0.0001"} 3513
+```
+
+Mean **0.17ms per request while hitting Postgres on every single one**, with
+38% still completing in under 100µs. With the cache doing its job the cost
+is smaller than that and smaller than this harness resolves.
+
+## What this does and does not show
+
+It shows the request path does not pay for scanning: even with the verdict
+cache fully disabled, admission adds a fraction of a millisecond, because
+the expensive work happens out of band in the Python worker.
+
+It does **not** show what a saturated or remote database does to that
+figure — Postgres was local and idle. An operator running the verdict store
+across a network should re-measure, and `lookup_timeout` (default 250ms)
+plus `on_unavailable` are what bound the damage when it is slow.
+
+It also says nothing about discovery cost, which is off the request path by
+construction and scales with the fleet's tool count rather than its traffic.
