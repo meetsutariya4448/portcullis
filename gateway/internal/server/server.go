@@ -449,6 +449,12 @@ func (s *Server) forward(ctx context.Context, group []*router.Upstream, body []b
 			var attemptErr error
 			if upstream.LegacyPool != nil {
 				resp, attemptErr = upstream.LegacyPool.Forward(ctx, body)
+				// The legacy path uses the pool's own breaker, which nothing
+				// published: portcullis_circuit_breaker_state simply had no
+				// series for a legacy upstream, so the breaker lifecycle the
+				// chaos demo graphs was invisible for half the fleet.
+				metrics.CircuitBreakerState.WithLabelValues(upstream.Name).
+					Set(float64(upstream.LegacyPool.BreakerState()))
 			} else {
 				resp, attemptErr = s.forwardNative(ctx, upstream, body, headers)
 			}
@@ -485,7 +491,11 @@ func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, b
 	if err := upstream.Bulkhead.Acquire(ctx); err != nil {
 		metrics.BulkheadRejectedTotal.WithLabelValues(upstream.Name).Inc()
 		// A canceled wait for a bulkhead slot never touched the network
-		// either -- same reasoning as the breaker-open case above.
+		// either -- same reasoning as the breaker-open case above. Release
+		// the admission the breaker just granted: if it was the half-open
+		// trial, failing to hand it back would wedge the breaker in
+		// half-open permanently.
+		upstream.Breaker.Abort()
 		return nil, retry.SkipTarget(err)
 	}
 	metrics.BulkheadWaitSeconds.WithLabelValues(upstream.Name).Observe(time.Since(waitStart).Seconds())
@@ -517,7 +527,11 @@ func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, b
 		}
 		return nil, err // pre-connect failure: safe to retry
 	}
-	upstream.Breaker.Record(true)
+	// Record health from the status, not merely from "a response arrived":
+	// an upstream returning 5xx to everything is exactly what a breaker is
+	// for, and counting only transport errors left it closed through 30
+	// consecutive 500s with no failover.
+	upstream.Breaker.Record(translate.HealthyStatus(resp.StatusCode))
 	metrics.CircuitBreakerState.WithLabelValues(upstream.Name).Set(float64(upstream.Breaker.State()))
 	return resp, nil
 }

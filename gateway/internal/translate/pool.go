@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/meetsutariya4448/portcullis/gateway/internal/metrics"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/retry"
@@ -33,6 +34,13 @@ import (
 // DefaultMaxPoolSize bounds how many concurrent legacy sessions Portcullis
 // will hold open to a single upstream.
 const DefaultMaxPoolSize = 8
+
+// MaxLegacyResponseBytes bounds a legacy upstream response, which the
+// translation shim must buffer whole in order to tell a result from a
+// server-initiated request. Matches the 10 MiB cap the server applies to
+// client request bodies, so both directions are bounded by the same
+// figure.
+const MaxLegacyResponseBytes int64 = 10 << 20
 
 // Pool is a bounded, LIFO pool of live legacy sessions to a single
 // 2025-11-25 upstream. Reusing the most-recently-released session first
@@ -115,7 +123,15 @@ func (p *Pool) Forward(ctx context.Context, body []byte) (*http.Response, error)
 
 	sess, err := p.lease(ctx)
 	if err != nil {
-		if !errors.Is(err, ErrPoolExhausted) {
+		if errors.Is(err, ErrPoolExhausted) {
+			// Pool exhaustion is a capacity signal about Portcullis's own
+			// bound, not evidence the upstream is unhealthy, so it stays out
+			// of breaker accounting. But the Allow above may have consumed
+			// the single half-open trial, and without releasing it the
+			// breaker would sit in half-open forever, refusing every
+			// subsequent request for the life of the process.
+			p.breaker.Abort()
+		} else {
 			p.breaker.Record(false)
 		}
 		return nil, err
@@ -160,7 +176,10 @@ func (p *Pool) Forward(ctx context.Context, body []byte) (*http.Response, error)
 		return nil, retry.NonRetryable(ErrUnsupportedMRTR)
 	}
 
-	p.breaker.Record(true)
+	// An upstream that answers 5xx is unhealthy even though the transport
+	// worked; counting only transport errors let a permanently-500 upstream
+	// keep its breaker closed forever.
+	p.breaker.Record(HealthyStatus(resp.StatusCode))
 	p.returnSession(sess)
 	resp.Body = io.NopCloser(bytes.NewReader(buffered))
 	return resp, nil
@@ -177,7 +196,19 @@ func (p *Pool) lease(ctx context.Context) (*Session, error) {
 		if sess == nil {
 			break
 		}
+		// Health-checked on EVERY lease, not only after an idle period.
+		// That is a second upstream round trip per proxied legacy request,
+		// and it was tempting to skip for a recently-used session -- but the
+		// failure it catches is the legacy server forgetting the session
+		// (a restart, an expiry), which can happen a millisecond after the
+		// last successful use and is not detectable from elapsed time.
+		// Worse, missing it is not recoverable: a request dispatched onto a
+		// dead session fails after the request was handed to the upstream,
+		// which Forward must classify as NonRetryable, so the client gets a
+		// hard error instead of a transparently re-established session.
+		// One predictable ping beats an unpredictable non-retryable failure.
 		if p.healthCheck(ctx, sess) {
+			sess.LastUsedAt = time.Now()
 			metrics.LegacySessionReusedTotal.WithLabelValues(p.name).Inc()
 			return sess, nil
 		}
@@ -254,9 +285,19 @@ func (p *Pool) dropLive() {
 // request (an MRTR flow this gateway doesn't bridge) rather than an
 // ordinary JSON-RPC result.
 func sniffUnsupportedMRTR(resp *http.Response) (unsupported bool, body []byte, err error) {
-	body, err = io.ReadAll(resp.Body)
+	// Bounded: this buffers a whole response from an upstream Portcullis
+	// does not trust. The client-facing side has http.MaxBytesReader; this
+	// side had nothing, so a hostile or broken legacy server could drive
+	// gateway memory with a single unbounded body. Reading one byte past
+	// the cap is how an over-limit response is detected rather than
+	// silently truncated into something that might still parse.
+	limited := io.LimitReader(resp.Body, MaxLegacyResponseBytes+1)
+	body, err = io.ReadAll(limited)
 	if err != nil {
 		return false, nil, err
+	}
+	if int64(len(body)) > MaxLegacyResponseBytes {
+		return false, nil, fmt.Errorf("legacy upstream response exceeds %d bytes", MaxLegacyResponseBytes)
 	}
 
 	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {

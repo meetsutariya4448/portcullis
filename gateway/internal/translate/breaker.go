@@ -55,6 +55,29 @@ func (s BreakerState) String() string {
 	}
 }
 
+// HealthyStatus reports whether an upstream HTTP status counts as a
+// healthy response for breaker accounting.
+//
+// Only transport errors used to count as failures, so an upstream that was
+// up but answering 500 to everything never tripped its breaker and never
+// triggered failover: 30 consecutive 500s left the breaker closed. "Up but
+// broken" is the common case a breaker exists for, and it was the one case
+// it ignored.
+//
+// 5xx counts as a failure. 4xx does not: a 400 or 404 is the upstream
+// correctly rejecting this particular request, and letting a client trip a
+// shared breaker by sending malformed requests would hand it a
+// denial-of-service against every other client of that upstream. 501 and
+// 505 are likewise excluded -- "I don't implement this" is a stable answer
+// about the request, not a health signal.
+func HealthyStatus(code int) bool {
+	switch code {
+	case 501, 505:
+		return true
+	}
+	return code < 500
+}
+
 type bucket struct {
 	start     time.Time
 	successes int
@@ -164,6 +187,25 @@ func (b *CircuitBreaker) Allow() bool {
 		return true
 	default:
 		return true
+	}
+}
+
+// Abort releases an admission granted by Allow for a request that never
+// reached the upstream, without recording an outcome.
+//
+// Allow reserves the single half-open trial by setting halfOpenInFlight,
+// and only Record clears it. A caller that was admitted and then bailed
+// out before touching the network -- pool exhaustion, a canceled wait for
+// a bulkhead slot -- left that flag set forever, and every later Allow in
+// half-open returned false. One such event permanently wedged the breaker
+// for the life of the process, with no path back and no outcome to justify
+// it. Abort is that path back: it undoes the reservation without polluting
+// the window with a failure the upstream never had a chance to cause.
+func (b *CircuitBreaker) Abort() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == stateHalfOpen {
+		b.halfOpenInFlight = false
 	}
 }
 
