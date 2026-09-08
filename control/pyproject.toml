@@ -3,13 +3,21 @@ name = "portcullis-control"
 version = "0.1.0"
 description = "Portcullis control plane: tool-poisoning scanner and evals"
 requires-python = ">=3.12"
+# Version-bounded deliberately. These were unpinned, which meant a report
+# in evals/REPORT.md could not be reproduced: `sentence-transformers`
+# determines every layer-2 embedding and `anthropic` determines layer 3's
+# SDK behaviour, so an unbounded resolve silently changes the measurement.
+# The eval's run manifest records the *resolved* versions; these bounds
+# keep the resolve from wandering across a major version between runs.
 dependencies = [
-    "certifi",
-    "anthropic",
-    "pydantic",
-    "psycopg[binary]",
-    "pgvector",
-    "sentence-transformers",
+    "certifi>=2026.7.22",
+    "anthropic~=1.4",
+    "pydantic~=2.13",
+    "psycopg[binary]~=3.3",
+    "pgvector~=0.5.0",
+    # Tightest bound of the set: a minor bump here can change embedding
+    # vectors, and therefore every layer-2 similarity score.
+    "sentence-transformers~=6.0.1",
 ]
 
 [project.optional-dependencies]
@@ -27,4 +35,7 @@ build-backend = "hatchling.build"
 packages = ["scanner"]
 
 [tool.pytest.ini_options]
-testpaths = ["scanner"]
+# evals/ is not packaged (see above) but is tested: the split assignment and
+# run fingerprint are what keep reported numbers attributable to one
+# configuration, so they need coverage of their own.
+testpaths = ["scanner", "evals", "app"]
