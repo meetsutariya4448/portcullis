@@ -225,6 +225,12 @@ class SentenceTransformerEmbedder:
     def __init__(self, model: str = "all-MiniLM-L6-v2"):
         from sentence_transformers import SentenceTransformer
 
+        # Kept as a public attribute so callers can record which model
+        # actually produced a set of embeddings. The eval harness folds it
+        # into its run fingerprint; before this existed, the report
+        # hardcoded the model name in its own template, which would have
+        # kept saying "all-MiniLM-L6-v2" even for a run that used another.
+        self.model_name = model
         self._model = SentenceTransformer(model)
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:

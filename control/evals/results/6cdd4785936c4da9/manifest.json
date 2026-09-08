@@ -1,0 +1,29 @@
+{
+  "config": {
+    "corpus_path": "/Users/meetsutariya/Desktop/portcullis/control/evals/corpus/corpus.jsonl",
+    "corpus_rows": 139,
+    "corpus_sha256": "da8cd5951afe4c07654d28f82344843c73dd124bc8631f04c94aa209123295d7",
+    "embedder_model": "all-MiniLM-L6-v2",
+    "git_sha": "bdda114087c8c2090e8ec749e36820ed7d5c3780-dirty",
+    "harness_version": "2",
+    "layer1_short_circuit": 0.85,
+    "layer2_short_circuit": 0.92,
+    "layer2_threshold": 0.85,
+    "limit": null,
+    "model": "claude-opus-5",
+    "packages": {
+      "anthropic": "1.4.0",
+      "pydantic": "2.13.5",
+      "sentence-transformers": "6.0.1",
+      "torch": "2.14.0",
+      "transformers": "5.16.1"
+    },
+    "scored_split": "held_out",
+    "skip_llm": true,
+    "split_spec": "v1:grouped:sha256:target=0.4"
+  },
+  "fingerprint": "6cdd4785936c4da9",
+  "partial": true,
+  "started_at": "2026-09-08T01:46:46.521426+00:00",
+  "wall_elapsed_s": 43.042
+}

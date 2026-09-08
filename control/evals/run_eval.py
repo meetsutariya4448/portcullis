@@ -9,14 +9,24 @@ and the evidence-span rejection rate.
 
 METHODOLOGY -- read before trusting a number out of context:
 
-  * This is NOT a held-out test set. See the "Methodology and limitations"
-    section this script writes into REPORT.md for the full disclosure
-    (corpus provenance, leave-one-out details, verdict-scoring conventions).
-    The short version: layer 2's malicious-attack index is built from this
-    same corpus (leave-one-out per row, so a row never matches only itself),
-    and layer 3's prompt was written without looking at eval numbers -- but
-    neither claim generalization to attacks the corpus's small seed set
-    didn't already represent in some form.
+  * Every headline number is computed over the corpus's HELD-OUT split
+    only, against a layer-2 attack index built from the TRAIN split only.
+    One index, one scored population, nothing scored that is in the index
+    -- so precision and recall describe the same configuration and the F1
+    over them means something. (Before this, malicious rows were scored
+    against a row- or family-excluded index while benign rows were scored
+    against the full one, blending two configurations inside every
+    published pair.) See split.py for how the split is assigned.
+  * Every run is fingerprinted (see fingerprint.py) over its corpus hash,
+    split spec, model, thresholds, embedder and resolved library versions,
+    and writes machine-readable artifacts to evals/results/<fingerprint>/.
+    Numbers carrying different fingerprints are not comparable. A partial
+    run (--limit / --skip-llm) is recorded but refuses to overwrite
+    REPORT.md.
+  * A held-out family is unseen by the index, but still drawn from the same
+    11-seed pool the corpus was built from -- not an independent attack
+    corpus. Layer 1's rules were also authored with those seeds visible.
+    Both caveats are restated in the generated report.
   * Every threshold used is the untouched default already defined in
     scanner/cascade.py and scanner/layer2_similarity.py -- this script does
     not search for, or report, whichever threshold maximizes the headline
@@ -28,7 +38,10 @@ METHODOLOGY -- read before trusting a number out of context:
     downstream to resolve the ambiguity, would let the tool through. Each
     layer's rejection/deferral rate is also reported on its own line so
     this convention doesn't hide it.
-  * Layer 3 is genuinely called once per corpus row (a real Anthropic API
+  * An API/transport error on a layer-3 call is reported separately and an
+    error-excluded figure is published beside the conventional one. An
+    outage is not a missed detection.
+  * Layer 3 is genuinely called once per held-out row (a real Anthropic API
     call, real cost, real latency) to produce fair standalone layer-3
     metrics. The cascade run then REPLAYS those same cached results for
     rows that fall through to layer 3, rather than issuing a second call
@@ -53,10 +66,14 @@ import math
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import fingerprint  # noqa: E402  (needs the sys.path lines above)
+import split  # noqa: E402
 
 from scanner.cascade import (
     DEFAULT_LAYER1_SHORT_CIRCUIT_CONFIDENCE,
@@ -69,6 +86,7 @@ from scanner.layer3_llm import DEFAULT_MODEL, Layer3LLM
 
 DEFAULT_CORPUS_PATH = Path(__file__).resolve().parent / "corpus" / "corpus.jsonl"
 DEFAULT_REPORT_PATH = Path(__file__).resolve().parent / "REPORT.md"
+DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 DEFAULT_LAYER2_THRESHOLD = 0.85  # Layer2Similarity's own default, untouched.
 
 # Pricing snapshot for claude-opus-5, cached 2026-06-24 (see control/CLAUDE.md
@@ -130,25 +148,30 @@ def _build_layer2_cache(
 ) -> dict[str, Timed]:
     """exclude_fn(candidate_row, scored_row) -> bool: True if candidate_row's
     embedding should be left out of the index when scoring scored_row.
-    Benign rows are always scored against the full malicious-attack index --
-    there's nothing of theirs to leave out.
-    """
-    full_store = InMemoryVectorStore()
-    for row, emb in zip(malicious_rows, malicious_embeddings):
-        full_store.upsert(row["id"], emb, row["attack_class"])
-    full_layer2 = Layer2Similarity(embedder=embedder, store=full_store, threshold=threshold)
 
+    NOTE: this per-row-index construction is now used ONLY for the
+    supplementary leave-one-out / leave-one-seed-family-out **recall**
+    diagnostic over malicious rows (see run_layer2_diagnostics). It must
+    not be used to produce a precision or F1 figure: each scored row sees a
+    different index, so a precision computed by mixing these scores with
+    benign scores from a full index blends configurations inside a single
+    number. That was the defect this harness's headline numbers carried.
+    The headline path is run_layer2_heldout below: one fixed index, one
+    scored population.
+    """
     malicious_ids = {r["id"] for r in malicious_rows}
     out = {}
     for row in rows:
-        if row["id"] in malicious_ids:
-            store = InMemoryVectorStore()
-            for other_row, emb in zip(malicious_rows, malicious_embeddings):
-                if not exclude_fn(other_row, row):
-                    store.upsert(other_row["id"], emb, other_row["attack_class"])
-            layer2 = Layer2Similarity(embedder=embedder, store=store, threshold=threshold)
-        else:
-            layer2 = full_layer2
+        if row["id"] not in malicious_ids:
+            raise ValueError(
+                f"row {row['id']} is not malicious; the leave-one-out diagnostic "
+                "is recall-only and must be given malicious rows exclusively"
+            )
+        store = InMemoryVectorStore()
+        for other_row, emb in zip(malicious_rows, malicious_embeddings):
+            if not exclude_fn(other_row, row):
+                store.upsert(other_row["id"], emb, other_row["attack_class"])
+        layer2 = Layer2Similarity(embedder=embedder, store=store, threshold=threshold)
 
         t0 = time.perf_counter()
         result = layer2.score(row["description"])
@@ -156,33 +179,73 @@ def _build_layer2_cache(
     return out
 
 
-def run_layer2(rows: list[dict], malicious_rows: list[dict], threshold: float) -> tuple[dict[str, Timed], dict[str, Timed]]:
-    """Returns (leave_one_out_cache, leave_one_seed_family_out_cache).
+def run_layer2_heldout(
+    scored_rows: list[dict],
+    index_rows: list[dict],
+    threshold: float,
+) -> tuple[dict[str, Timed], SentenceTransformerEmbedder]:
+    """The headline layer-2 configuration: ONE index, built from the
+    train-split malicious rows, against which every scored row -- benign and
+    malicious alike -- is scored.
 
-    Leave-one-out excludes only the scored sample's own embedding -- but 27
-    of the 38 malicious rows are mechanical variants of 11 seeds (rename
-    tool, move payload, swap target -- see corpus/README.md), so a variant's
-    parent seed and sibling variants stay in the index. Leave-one-seed-
-    family-out additionally excludes the whole family (parent seed + every
-    other variant of it), so a family's recall reflects generalization from
-    OTHER seed families and attack classes only, not "found a near-identical
-    sibling still sitting in the index." Both are computed and reported --
-    see the Results section for what the gap between them means.
+    Because no scored row is in the index, there is nothing to leave out and
+    no per-row index variation. Precision and recall therefore come from the
+    same setup, which is what makes an F1 over them meaningful.
     """
     embedder = SentenceTransformerEmbedder()
 
-    print(f"  embedding {len(malicious_rows)} malicious descriptions for the attack index...")
+    print(f"  embedding {len(index_rows)} train-split malicious descriptions for the attack index...")
+    index_embeddings = embedder.embed([r["description"] for r in index_rows]) if index_rows else []
+
+    store = InMemoryVectorStore()
+    for row, emb in zip(index_rows, index_embeddings):
+        store.upsert(row["id"], emb, row["attack_class"])
+    layer2 = Layer2Similarity(embedder=embedder, store=store, threshold=threshold)
+
+    print(f"  scoring {len(scored_rows)} held-out rows against it...")
+    out = {}
+    for row in scored_rows:
+        t0 = time.perf_counter()
+        result = layer2.score(row["description"])
+        out[row["id"]] = Timed(result, time.perf_counter() - t0)
+    return out, embedder
+
+
+def run_layer2_diagnostics(
+    malicious_rows: list[dict],
+    embedder: SentenceTransformerEmbedder,
+    threshold: float,
+) -> tuple[dict[str, Timed], dict[str, Timed]]:
+    """Supplementary, **recall-only** diagnostic: (leave_one_out, leave_one_seed_family_out).
+
+    This is not the headline configuration -- run_layer2_heldout is. It is
+    kept because the gap between the two schemes is a real and useful
+    finding: leave-one-out excludes only the scored sample's own embedding,
+    but 27 of the 38 malicious rows are mechanical variants of 11 seeds
+    (rename tool, move payload, swap target -- see corpus/README.md), so a
+    variant's parent and siblings stay in the index and a "hit" is often
+    near-duplicate retrieval. Leave-one-seed-family-out excludes the whole
+    family, so recall there reflects generalization from OTHER families
+    only. The gap quantifies how much of layer 2's apparent recall was
+    sibling retrieval.
+
+    Scored over malicious rows only, and reported only as recall. Adding
+    benign rows here would mean scoring them against a different index than
+    the malicious rows saw, which is exactly the blend this harness no
+    longer publishes.
+    """
+    print(f"  embedding {len(malicious_rows)} malicious descriptions for the diagnostic index...")
     malicious_embeddings = embedder.embed([r["description"] for r in malicious_rows])
 
-    print("  building leave-one-out index...")
+    print("  leave-one-out (recall diagnostic)...")
     loo_cache = _build_layer2_cache(
-        rows, malicious_rows, embedder, malicious_embeddings, threshold,
+        malicious_rows, malicious_rows, embedder, malicious_embeddings, threshold,
         exclude_fn=lambda candidate, scored: candidate["id"] == scored["id"],
     )
 
-    print("  building leave-one-seed-family-out index...")
+    print("  leave-one-seed-family-out (recall diagnostic)...")
     family_cache = _build_layer2_cache(
-        rows, malicious_rows, embedder, malicious_embeddings, threshold,
+        malicious_rows, malicious_rows, embedder, malicious_embeddings, threshold,
         exclude_fn=lambda candidate, scored: seed_family_id(candidate) == seed_family_id(scored),
     )
 
@@ -195,11 +258,23 @@ def run_layer2(rows: list[dict], malicious_rows: list[dict], threshold: float) -
 MAX_TOLERABLE_API_ERROR_RATE = 0.2  # above this, the run is broken, not "layer 3 missed some attacks"
 
 
-def run_layer3(rows: list[dict], model: str) -> dict[str, Timed]:
+def run_layer3(rows: list[dict], model: str) -> tuple[dict[str, Timed], set[str]]:
+    """Returns (results_by_row_id, ids_that_failed_with_an_api_error).
+
+    The second element exists because an API error is not a detection
+    result. Folding it into the "not flagged malicious" bucket -- which is
+    what happens to every `layer3_failure` for scoring purposes -- makes a
+    transient outage look like a recall miss. The committed report before
+    this change carried 10/139 such rows straight in its recall
+    denominator. Reporting the id set lets the caller publish an
+    error-excluded figure beside the conventional one instead of choosing
+    silently between them.
+    """
     from anthropic import AuthenticationError, PermissionDeniedError
 
     layer3 = Layer3LLM(model=model)
     out = {}
+    api_error_ids: set[str] = set()
     total = len(rows)
     api_error_count = 0
     for i, row in enumerate(rows, 1):
@@ -217,6 +292,7 @@ def run_layer3(rows: list[dict], model: str) -> dict[str, Timed]:
             from scanner.layer3_llm import Layer3Result
 
             api_error_count += 1
+            api_error_ids.add(row["id"])
             result = Layer3Result(
                 verdict="layer3_failure",
                 attack_class=None,
@@ -242,7 +318,7 @@ def run_layer3(rows: list[dict], model: str) -> dict[str, Timed]:
     elif api_error_count:
         print(f"  note: {api_error_count}/{total} layer-3 calls failed transiently and are recorded as layer3_failure.")
 
-    return out
+    return out, api_error_ids
 
 
 # --- cascade (replays cached layer2/layer3 results, no re-billing) --------
@@ -436,62 +512,46 @@ def compute_cascade_metrics(cascade_cache: dict[str, Timed], rows: list[dict], m
     )
 
 
-def render_cascade_comparison(loo: CascadeMetrics, family: CascadeMetrics, n_rows: int) -> str:
-    lines = [
-        f"### Full cascade -- layer2 indexing scheme comparison (n={n_rows})",
-        "",
-        "| Layer2 indexing scheme | TP | FP | FN | TN | precision | recall | F1 | produced_by (l1/l2/l3) | LLM invocation rate |",
-        "|---|---|---|---|---|---|---|---|---|---|",
-        f"| Leave-one-out | {loo.prf.tp} | {loo.prf.fp} | {loo.prf.fn} | {loo.prf.tn} | "
-        f"{fmt(loo.prf.precision)} | {fmt(loo.prf.recall)} | {fmt(loo.prf.f1)} | "
-        f"{loo.produced_by['layer1']}/{loo.produced_by['layer2']}/{loo.produced_by['layer3']} | "
-        f"{fmt(loo.invocation_rate)} ({loo.llm_invocations}/{n_rows}) |",
-        f"| Leave-one-seed-family-out | {family.prf.tp} | {family.prf.fp} | {family.prf.fn} | {family.prf.tn} | "
-        f"{fmt(family.prf.precision)} | {fmt(family.prf.recall)} | {fmt(family.prf.f1)} | "
-        f"{family.produced_by['layer1']}/{family.produced_by['layer2']}/{family.produced_by['layer3']} | "
-        f"{fmt(family.invocation_rate)} ({family.llm_invocations}/{n_rows}) |",
-        "",
-        "**Why they differ:** the cascade's layer-2 branch is the exact same leaky-vs-generalizing tradeoff "
-        "reported for layer 2 standalone above -- with leave-one-out, a malicious row's siblings are still in "
-        "the index, so layer 2's 0.92 cascade short-circuit fires easily and layer 2 carries most of the "
-        "cascade's recall. With leave-one-seed-family-out, layer 2's similarity to a genuinely-excluded family "
-        "rarely clears even its own 0.85 standalone threshold (see the layer 2 section above -- family-out "
-        "recall there is 0.000), so it essentially never clears the cascade's stricter 0.92 bar either. Under "
-        "family-out, detection is carried almost entirely by layer 1 (confident rule-based catches) and "
-        "layer 3 (whatever falls through) instead -- the `produced_by` column above shows exactly how the "
-        "load shifts. **Neither row is deleted or superseded: leave-one-out is what the cascade does when its "
-        "attack index already contains something near-identical to the incoming attack (the realistic "
-        "in-production case, since a real deployment's index only grows); leave-one-seed-family-out is what "
-        "the cascade does against a genuinely unfamiliar attack construction, which is the harder and more "
-        "honest question if you're asking \"how well does this generalize.\"**",
-        "",
-    ]
-    return "\n".join(lines)
+def render_layer2_diagnostic(
+    threshold: float,
+    loo_recall: tuple[int, int],
+    family_recall: tuple[int, int],
+    n_malicious: int,
+) -> str:
+    """Recall-only, and labelled as supplementary.
 
-
-def render_layer2_comparison(threshold: float, loo_prf: PRF, family_prf: PRF, n_malicious: int) -> str:
+    Precision/F1 columns were deliberately removed from this table. Each
+    scored row here sees a different index, and the benign rows they would
+    have to be weighed against see a different one again -- so any
+    precision computed across them describes no single configuration. The
+    headline block above is the number to quote; this table answers only
+    "how much of layer 2's recall is sibling retrieval?"
+    """
+    loo_caught, loo_total = loo_recall
+    fam_caught, fam_total = family_recall
     lines = [
-        f"### Layer 2 -- embedding similarity, indexing scheme comparison (threshold={threshold}, n={loo_prf.n})",
+        f"### Supplementary diagnostic -- layer 2 index leakage (threshold={threshold})",
         "",
-        "| Indexing scheme | TP | FP | FN | TN | precision | recall | F1 |",
-        "|---|---|---|---|---|---|---|---|",
-        f"| Leave-one-out (original) | {loo_prf.tp} | {loo_prf.fp} | {loo_prf.fn} | {loo_prf.tn} | "
-        f"{fmt(loo_prf.precision)} | {fmt(loo_prf.recall)} | {fmt(loo_prf.f1)} |",
-        f"| Leave-one-seed-family-out | {family_prf.tp} | {family_prf.fp} | {family_prf.fn} | {family_prf.tn} | "
-        f"{fmt(family_prf.precision)} | {fmt(family_prf.recall)} | {fmt(family_prf.f1)} |",
+        "*Recall only, over all malicious rows. Not the headline configuration, and not comparable "
+        "with the held-out numbers above: every row here is scored against an index built for that "
+        "row alone.*",
+        "",
+        "| Indexing scheme | recall | caught / total |",
+        "|---|---|---|",
+        f"| Leave-one-out | {fmt(loo_caught / loo_total) if loo_total else 'nan'} | {loo_caught}/{loo_total} |",
+        f"| Leave-one-seed-family-out | {fmt(fam_caught / fam_total) if fam_total else 'nan'} | {fam_caught}/{fam_total} |",
         "",
         f"**Why they differ:** 27 of the {n_malicious} malicious samples are mechanical variants of 11 seeds "
         "(rename tool / move payload / swap target -- see corpus/README.md). Leave-one-out only removes the "
         "scored sample's OWN embedding from the index; its parent seed and sibling variants (e.g. a seed with "
         "6 variants keeps all 6 in the index when scoring any one of them) remain, so a hit is often \"found "
         "the near-identical sibling still in the index\" rather than a generalized detection. "
-        "Leave-one-seed-family-out removes the scored sample's ENTIRE family (parent seed + every other "
-        "variant of it) before scoring it, so its recall reflects generalization from OTHER seed families and "
-        "attack classes only. **The leave-one-out number is not deleted or superseded -- it answers a "
-        "different, still-useful question (\"can layer 2 retrieve a near-duplicate of something already in "
-        "the attack index\"), while leave-one-seed-family-out is the closer proxy for generalization to a "
-        "genuinely unseen attack. The gap between the two rows above is itself the finding: it quantifies how "
-        "much of layer 2's apparent recall was sibling retrieval versus recognition of an unfamiliar attack.**",
+        "Leave-one-seed-family-out removes the scored sample's ENTIRE family before scoring it, so its recall "
+        "reflects generalization from OTHER seed families and attack classes only. **The gap between these "
+        "two rows is the finding: it quantifies how much of layer 2's apparent recall was sibling retrieval "
+        "rather than recognition of an unfamiliar attack.** The held-out configuration reported above answers "
+        "the same question more directly -- its index contains no scored row's family at all -- so these rows "
+        "are retained as corroboration, not as an alternative headline.",
         "",
     ]
     return "\n".join(lines)
@@ -506,12 +566,22 @@ def render_latency(title: str, latencies_s: list[float]) -> str:
 # --- main ---------------------------------------------------------------------
 
 
+def _predictions(cache: dict[str, Timed]) -> dict[str, bool]:
+    return {rid: t.result.verdict == "malicious" for rid, t in cache.items()}
+
+
+def _recall_pair(rows: list[dict], pred: dict[str, bool]) -> tuple[int, int]:
+    caught = sum(1 for r in rows if pred.get(r["id"]))
+    return caught, len(rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS_PATH)
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT_PATH)
-    parser.add_argument("--limit", type=int, default=None, help="Only score the first N rows (smoke-test aid).")
-    parser.add_argument("--skip-llm", action="store_true", help="Skip layer 3 / cascade entirely (smoke-test aid).")
+    parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    parser.add_argument("--limit", type=int, default=None, help="Only score the first N rows (smoke-test aid; marks the run partial).")
+    parser.add_argument("--skip-llm", action="store_true", help="Skip layer 3 / cascade entirely (smoke-test aid; marks the run partial).")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--layer2-threshold", type=float, default=DEFAULT_LAYER2_THRESHOLD)
     parser.add_argument("--layer1-short-circuit", type=float, default=DEFAULT_LAYER1_SHORT_CIRCUIT_CONFIDENCE)
@@ -521,146 +591,222 @@ def main() -> None:
     run_started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     wall_start = time.perf_counter()
 
-    rows = load_corpus(args.corpus)
-    if args.limit:
-        rows = rows[: args.limit]
-    benign_rows = [r for r in rows if r["label"] == "benign"]
-    malicious_rows = [r for r in rows if r["label"] == "malicious"]
+    all_rows = load_corpus(args.corpus)
+    missing_split = [r["id"] for r in all_rows if "split" not in r]
+    if missing_split:
+        print(
+            f"ABORTING: {len(missing_split)} corpus rows have no `split` field "
+            f"(first: {missing_split[:3]}). Re-run corpus/build_corpus.py -- the "
+            f"held-out configuration cannot be constructed without it."
+        )
+        sys.exit(1)
 
-    print(f"Corpus: {len(rows)} rows ({len(benign_rows)} benign, {len(malicious_rows)} malicious)")
+    rows = all_rows[: args.limit] if args.limit else all_rows
+
+    # The scored population is the held-out side only. The train side exists
+    # solely to build layer 2's attack index -- nothing scored here has ever
+    # been in that index, which is what makes precision and recall below
+    # products of the same configuration.
+    scored_rows = [r for r in rows if r["split"] == split.HELD_OUT]
+    index_rows = [r for r in rows if r["split"] == split.TRAIN and r["label"] == "malicious"]
+    all_malicious = [r for r in all_rows if r["label"] == "malicious"]
+
+    benign_rows = [r for r in scored_rows if r["label"] == "benign"]
+    malicious_rows = [r for r in scored_rows if r["label"] == "malicious"]
+
+    if not scored_rows or not malicious_rows:
+        print(
+            "ABORTING: the held-out split is empty (or has no malicious rows) for this "
+            "corpus slice. --limit takes the first N rows in file order, which is "
+            "benign-first; use a larger N or drop --limit."
+        )
+        sys.exit(1)
+
+    print(f"Corpus: {len(all_rows)} rows total; split spec {split.SPLIT_SPEC}")
+    print(split.summarize(all_rows))
+    print(
+        f"Scoring {len(scored_rows)} held-out rows "
+        f"({len(benign_rows)} benign, {len(malicious_rows)} malicious) "
+        f"against an index of {len(index_rows)} train-split malicious rows."
+    )
 
     print("Running layer 1 (deterministic rules)...")
-    l1_cache = run_layer1(rows)
+    l1_cache = run_layer1(scored_rows)
 
-    print("Running layer 2 (local embedding similarity, two indexing schemes)...")
-    l2_cache, l2_family_cache = run_layer2(rows, malicious_rows, args.layer2_threshold)
+    print("Running layer 2 (local embedding similarity, held-out index)...")
+    l2_cache, embedder = run_layer2_heldout(scored_rows, index_rows, args.layer2_threshold)
 
+    print("Running layer 2 index-leakage diagnostics (local, recall only)...")
+    l2_loo_cache, l2_family_cache = run_layer2_diagnostics(all_malicious, embedder, args.layer2_threshold)
+
+    api_error_ids: set[str] = set()
     if args.skip_llm:
         print("--skip-llm set: layer 3 and the cascade will not be scored.")
         l3_cache = None
         cascade_cache = None
-        cascade_family_cache = None
     else:
-        print(f"Running layer 3 ({args.model}, {len(rows)} real API calls)...")
-        l3_cache = run_layer3(rows, args.model)
-        print("Running cascade, leave-one-out layer2 (replays cached layer2/layer3 results)...")
+        print(f"Running layer 3 ({args.model}, {len(scored_rows)} real API calls)...")
+        l3_cache, api_error_ids = run_layer3(scored_rows, args.model)
+        print("Running cascade (replays cached layer2/layer3 results, no re-billing)...")
         cascade_cache = run_cascade(
-            rows, l1_cache, l2_cache, l3_cache, args.layer1_short_circuit, args.layer2_short_circuit
-        )
-        print("Running cascade, leave-one-seed-family-out layer2 (same layer3 cache, no re-billing)...")
-        cascade_family_cache = run_cascade(
-            rows, l1_cache, l2_family_cache, l3_cache, args.layer1_short_circuit, args.layer2_short_circuit
+            scored_rows, l1_cache, l2_cache, l3_cache, args.layer1_short_circuit, args.layer2_short_circuit
         )
 
     wall_elapsed = time.perf_counter() - wall_start
 
-    # ---- layer 1 metrics ----
-    l1_pred = {rid: t.result.verdict == "malicious" for rid, t in l1_cache.items()}
-    l1_uncertain_n = sum(1 for t in l1_cache.values() if t.result.verdict == "uncertain")
-    l1_prf = confusion_and_prf(rows, l1_pred)
-    l1_recall_by_class = recall_by_attack_class(malicious_rows, l1_pred)
-    l1_latencies = [t.latency_s for t in l1_cache.values()]
+    config = fingerprint.build(
+        corpus_path=args.corpus,
+        corpus_rows=len(all_rows),
+        split_spec=split.SPLIT_SPEC,
+        scored_split=split.HELD_OUT,
+        model=args.model,
+        embedder_model=getattr(embedder, "model_name", "unknown"),
+        layer2_threshold=args.layer2_threshold,
+        layer1_short_circuit=args.layer1_short_circuit,
+        layer2_short_circuit=args.layer2_short_circuit,
+        limit=args.limit,
+        skip_llm=args.skip_llm,
+    )
 
-    # ---- layer 2 metrics (both indexing schemes) ----
-    l2_pred = {rid: t.result.verdict == "malicious" for rid, t in l2_cache.items()}
-    l2_prf = confusion_and_prf(rows, l2_pred)
-    l2_recall_by_class = recall_by_attack_class(malicious_rows, l2_pred)
-    l2_latencies = [t.latency_s for t in l2_cache.values()]
-
-    l2_family_pred = {rid: t.result.verdict == "malicious" for rid, t in l2_family_cache.items()}
-    l2_family_prf = confusion_and_prf(rows, l2_family_pred)
-    l2_family_recall_by_class = recall_by_attack_class(malicious_rows, l2_family_pred)
-
+    metrics: dict = {"scored_rows": len(scored_rows), "index_rows": len(index_rows)}
     sections = []
-    sections.append(render_prf_block("Layer 1 -- deterministic rules", l1_prf, [
-        f"'uncertain' verdicts (scored as not-flagged above): {l1_uncertain_n}/{len(rows)}",
+
+    # ---- layer 1 ----
+    l1_pred = _predictions(l1_cache)
+    l1_uncertain_n = sum(1 for t in l1_cache.values() if t.result.verdict == "uncertain")
+    l1_prf = confusion_and_prf(scored_rows, l1_pred)
+    l1_latencies = [t.latency_s for t in l1_cache.values()]
+    metrics["layer1"] = {**asdict(l1_prf), "uncertain": l1_uncertain_n,
+                         "latency_p50_ms": percentile(l1_latencies, 50) * 1000,
+                         "latency_p95_ms": percentile(l1_latencies, 95) * 1000}
+
+    sections.append(render_prf_block("Layer 1 -- deterministic rules (held-out)", l1_prf, [
+        f"'uncertain' verdicts (scored as not-flagged above): {l1_uncertain_n}/{len(scored_rows)}",
     ]))
-    sections.append(render_recall_by_class(l1_recall_by_class))
+    sections.append(render_recall_by_class(recall_by_attack_class(malicious_rows, l1_pred)))
     sections.append(render_latency("Layer 1 latency", l1_latencies))
     sections.append("")
 
-    sections.append(render_layer2_comparison(args.layer2_threshold, l2_prf, l2_family_prf, len(malicious_rows)))
-    sections.append("Recall by attack class -- leave-one-out (excludes only the scored sample):")
-    sections.append(render_recall_by_class(l2_recall_by_class))
-    sections.append("Recall by attack class -- leave-one-seed-family-out (excludes the scored sample's whole seed family):")
-    sections.append(render_recall_by_class(l2_family_recall_by_class))
+    # ---- layer 2 ----
+    l2_pred = _predictions(l2_cache)
+    l2_prf = confusion_and_prf(scored_rows, l2_pred)
+    l2_latencies = [t.latency_s for t in l2_cache.values()]
+    metrics["layer2"] = {**asdict(l2_prf), "threshold": args.layer2_threshold,
+                         "index_rows": len(index_rows),
+                         "latency_p50_ms": percentile(l2_latencies, 50) * 1000,
+                         "latency_p95_ms": percentile(l2_latencies, 95) * 1000}
+
+    sections.append(render_prf_block(
+        f"Layer 2 -- embedding similarity (held-out; threshold={args.layer2_threshold}, "
+        f"index={len(index_rows)} train-split malicious rows)", l2_prf))
+    sections.append(render_recall_by_class(recall_by_attack_class(malicious_rows, l2_pred)))
     sections.append(render_latency("Layer 2 latency", l2_latencies))
     sections.append("Layer 2 cost: $0.00 (local model, no API calls)")
     sections.append("")
 
+    loo_recall = _recall_pair(all_malicious, _predictions(l2_loo_cache))
+    family_recall = _recall_pair(all_malicious, _predictions(l2_family_cache))
+    metrics["layer2_diagnostic"] = {
+        "leave_one_out_recall": loo_recall[0] / loo_recall[1] if loo_recall[1] else None,
+        "leave_one_out": list(loo_recall),
+        "leave_one_seed_family_out_recall": family_recall[0] / family_recall[1] if family_recall[1] else None,
+        "leave_one_seed_family_out": list(family_recall),
+    }
+    sections.append(render_layer2_diagnostic(args.layer2_threshold, loo_recall, family_recall, len(all_malicious)))
+
+    # ---- layer 3 ----
     if l3_cache is not None:
-        l3_pred = {rid: t.result.verdict == "malicious" for rid, t in l3_cache.items()}
-        l3_failure_n = sum(1 for t in l3_cache.values() if t.result.rejected_reason == "evidence_span_not_literal_substring")
-        l3_other_failure_n = sum(
+        l3_pred = _predictions(l3_cache)
+        l3_span_rejections = sum(
+            1 for t in l3_cache.values() if t.result.rejected_reason == "evidence_span_not_literal_substring"
+        )
+        l3_other_failures = sum(
             1 for t in l3_cache.values()
             if t.result.verdict == "layer3_failure" and t.result.rejected_reason != "evidence_span_not_literal_substring"
         )
-        l3_prf = confusion_and_prf(rows, l3_pred)
-        l3_recall_by_class = recall_by_attack_class(malicious_rows, l3_pred)
+        l3_prf = confusion_and_prf(scored_rows, l3_pred)
         l3_latencies = [t.latency_s for t in l3_cache.values()]
         l3_input_tokens = sum(t.result.input_tokens for t in l3_cache.values())
         l3_output_tokens = sum(t.result.output_tokens for t in l3_cache.values())
         l3_cost_per_1000 = (
-            (l3_input_tokens / len(rows)) * 1000 * OPUS5_INPUT_USD_PER_TOKEN
-            + (l3_output_tokens / len(rows)) * 1000 * OPUS5_OUTPUT_USD_PER_TOKEN
+            (l3_input_tokens / len(scored_rows)) * 1000 * OPUS5_INPUT_USD_PER_TOKEN
+            + (l3_output_tokens / len(scored_rows)) * 1000 * OPUS5_OUTPUT_USD_PER_TOKEN
         )
-        l3_span_rejection_rate = l3_failure_n / len(rows)
 
-        sections.append(render_prf_block(f"Layer 3 -- LLM classifier ({args.model}, standalone: every row classified)", l3_prf, [
-            f"evidence-span rejection rate: {fmt(l3_span_rejection_rate)} ({l3_failure_n}/{len(rows)})",
-            f"other layer3 failures (e.g. API errors, no parsed output): {l3_other_failure_n}/{len(rows)}",
-        ]))
-        sections.append(render_recall_by_class(l3_recall_by_class))
+        # An API error is not a detection outcome. Reported beside the
+        # conventional figure so a transient outage can never be read as a
+        # recall miss (see run_layer3's docstring).
+        healthy_rows = [r for r in scored_rows if r["id"] not in api_error_ids]
+        l3_prf_excl = confusion_and_prf(healthy_rows, l3_pred)
+
+        extra = [
+            f"evidence-span rejection rate: {fmt(l3_span_rejections / len(scored_rows))} "
+            f"({l3_span_rejections}/{len(scored_rows)})",
+            f"other layer3 failures (e.g. API errors, no parsed output): {l3_other_failures}/{len(scored_rows)}",
+        ]
+        if api_error_ids:
+            extra.append(
+                f"API-error rows excluded: {len(api_error_ids)}/{len(scored_rows)} -- "
+                f"excluding them, precision={fmt(l3_prf_excl.precision)} "
+                f"recall={fmt(l3_prf_excl.recall)} F1={fmt(l3_prf_excl.f1)} (n={l3_prf_excl.n}). "
+                f"An API error is an outage, not a missed detection; both figures are shown "
+                f"so neither convention hides the other."
+            )
+        else:
+            extra.append("API-error rows: 0 -- no error-excluded figure is needed for this run.")
+
+        metrics["layer3"] = {
+            **asdict(l3_prf), "model": args.model,
+            "api_error_rows": len(api_error_ids),
+            "prf_excluding_api_errors": asdict(l3_prf_excl),
+            "span_rejections": l3_span_rejections,
+            "other_failures": l3_other_failures,
+            "input_tokens": l3_input_tokens, "output_tokens": l3_output_tokens,
+            "cost_per_1000_usd": l3_cost_per_1000,
+            "latency_p50_ms": percentile(l3_latencies, 50) * 1000,
+            "latency_p95_ms": percentile(l3_latencies, 95) * 1000,
+        }
+
+        sections.append(render_prf_block(
+            f"Layer 3 -- LLM classifier ({args.model}, standalone: every held-out row classified)",
+            l3_prf, extra))
+        sections.append(render_recall_by_class(recall_by_attack_class(malicious_rows, l3_pred)))
         sections.append(render_latency("Layer 3 latency", l3_latencies))
         sections.append(
             f"Layer 3 tokens: {l3_input_tokens} input + {l3_output_tokens} output "
-            f"across {len(rows)} calls (standalone -- every row, not just cascade fallthrough)"
+            f"across {len(scored_rows)} calls (standalone -- every held-out row, not just cascade fallthrough)"
         )
         sections.append(f"Layer 3 estimated cost per 1,000 tools scanned (standalone): ${l3_cost_per_1000:.2f}")
         sections.append("")
 
+    # ---- cascade ----
     if cascade_cache is not None:
-        cm_loo = compute_cascade_metrics(cascade_cache, rows, malicious_rows)
-        cm_family = compute_cascade_metrics(cascade_family_cache, rows, malicious_rows)
+        cm = compute_cascade_metrics(cascade_cache, scored_rows, malicious_rows)
+        metrics["cascade"] = {
+            **asdict(cm.prf), "produced_by": cm.produced_by,
+            "llm_invocations": cm.llm_invocations, "invocation_rate": cm.invocation_rate,
+            "input_tokens": cm.input_tokens, "output_tokens": cm.output_tokens,
+            "cost_per_1000_usd": cm.cost_per_1000, "span_rejections": cm.span_rejections,
+            "latency_p50_ms": percentile(cm.latencies, 50) * 1000,
+            "latency_p95_ms": percentile(cm.latencies, 95) * 1000,
+        }
 
-        sections.append(render_cascade_comparison(cm_loo, cm_family, len(rows)))
-
-        sections.append(render_prf_block("Full cascade -- leave-one-out layer2", cm_loo.prf, [
-            f"produced_by breakdown: layer1={cm_loo.produced_by['layer1']}, "
-            f"layer2={cm_loo.produced_by['layer2']}, layer3={cm_loo.produced_by['layer3']} (n={len(rows)})",
-            f"LLM invocation rate (fraction reaching layer 3): {fmt(cm_loo.invocation_rate)} "
-            f"({cm_loo.llm_invocations}/{len(rows)})",
+        sections.append(render_prf_block("Full cascade (held-out)", cm.prf, [
+            f"produced_by breakdown: layer1={cm.produced_by['layer1']}, "
+            f"layer2={cm.produced_by['layer2']}, layer3={cm.produced_by['layer3']} (n={len(scored_rows)})",
+            f"LLM invocation rate (fraction reaching layer 3): {fmt(cm.invocation_rate)} "
+            f"({cm.llm_invocations}/{len(scored_rows)})",
             f"evidence-span rejection rate (of rows reaching layer 3): "
-            f"{fmt(cm_loo.span_rejections / cm_loo.llm_invocations) if cm_loo.llm_invocations else 'n/a'} "
-            f"({cm_loo.span_rejections}/{cm_loo.llm_invocations})",
+            f"{fmt(cm.span_rejections / cm.llm_invocations) if cm.llm_invocations else 'n/a'} "
+            f"({cm.span_rejections}/{cm.llm_invocations})",
         ]))
-        sections.append(render_recall_by_class(cm_loo.recall_by_class))
-        sections.append(render_latency("Cascade (leave-one-out) end-to-end latency", cm_loo.latencies))
+        sections.append(render_recall_by_class(cm.recall_by_class))
+        sections.append(render_latency("Cascade end-to-end latency", cm.latencies))
         sections.append(
-            f"Cascade (leave-one-out) tokens actually spent: {cm_loo.input_tokens} input + {cm_loo.output_tokens} "
-            f"output across {cm_loo.llm_invocations} LLM calls (out of {len(rows)} rows)"
+            f"Cascade tokens actually spent: {cm.input_tokens} input + {cm.output_tokens} "
+            f"output across {cm.llm_invocations} LLM calls (out of {len(scored_rows)} rows)"
         )
-        sections.append(f"Cascade (leave-one-out) estimated cost per 1,000 tools scanned: ${cm_loo.cost_per_1000:.2f}")
-        sections.append("")
-
-        sections.append(render_prf_block("Full cascade -- leave-one-seed-family-out layer2", cm_family.prf, [
-            f"produced_by breakdown: layer1={cm_family.produced_by['layer1']}, "
-            f"layer2={cm_family.produced_by['layer2']}, layer3={cm_family.produced_by['layer3']} (n={len(rows)})",
-            f"LLM invocation rate (fraction reaching layer 3): {fmt(cm_family.invocation_rate)} "
-            f"({cm_family.llm_invocations}/{len(rows)})",
-            f"evidence-span rejection rate (of rows reaching layer 3): "
-            f"{fmt(cm_family.span_rejections / cm_family.llm_invocations) if cm_family.llm_invocations else 'n/a'} "
-            f"({cm_family.span_rejections}/{cm_family.llm_invocations})",
-        ]))
-        sections.append(render_recall_by_class(cm_family.recall_by_class))
-        sections.append(render_latency("Cascade (leave-one-seed-family-out) end-to-end latency", cm_family.latencies))
-        sections.append(
-            f"Cascade (leave-one-seed-family-out) tokens actually spent: {cm_family.input_tokens} input + "
-            f"{cm_family.output_tokens} output across {cm_family.llm_invocations} LLM calls (out of {len(rows)} rows)"
-        )
-        sections.append(
-            f"Cascade (leave-one-seed-family-out) estimated cost per 1,000 tools scanned: ${cm_family.cost_per_1000:.2f}"
-        )
+        sections.append(f"Cascade estimated cost per 1,000 tools scanned: ${cm.cost_per_1000:.2f}")
         sections.append("")
 
     results_body = "\n".join(sections)
@@ -670,32 +816,85 @@ def main() -> None:
     print("=" * 80)
     print(f"Wall-clock eval duration: {wall_elapsed:.1f}s")
 
-    write_report(args, rows, benign_rows, malicious_rows, results_body, run_started_at, wall_elapsed)
-    print(f"\nWrote {args.report}")
+    per_row = []
+    for row in scored_rows:
+        rid = row["id"]
+        entry = {
+            "id": rid, "label": row["label"], "attack_class": row["attack_class"],
+            "split": row["split"],
+            "layer1": l1_cache[rid].result.verdict,
+            "layer2_similarity": l2_cache[rid].result.similarity,
+            "layer2": l2_cache[rid].result.verdict,
+        }
+        if l3_cache is not None:
+            entry["layer3"] = l3_cache[rid].result.verdict
+            entry["layer3_rejected_reason"] = l3_cache[rid].result.rejected_reason
+            entry["api_error"] = rid in api_error_ids
+        if cascade_cache is not None:
+            entry["cascade"] = cascade_cache[rid].result.verdict
+            entry["cascade_produced_by"] = cascade_cache[rid].result.produced_by
+        per_row.append(entry)
+
+    manifest = config.manifest(started_at=run_started_at, wall_elapsed_s=wall_elapsed)
+    out_dir = fingerprint.write_results(
+        args.results_dir, config, manifest=manifest, metrics=metrics, rows=per_row
+    )
+    print(f"\nWrote machine-readable results to {out_dir}")
+
+    if config.is_partial:
+        print(
+            f"\nPartial run (limit={args.limit}, skip_llm={args.skip_llm}): "
+            f"{args.report} was NOT overwritten. A partial measurement must not be "
+            f"published as if it were a full one -- see {out_dir}/manifest.json."
+        )
+        return
+
+    write_report(args, config, all_rows, scored_rows, index_rows, benign_rows, malicious_rows,
+                 results_body, run_started_at, wall_elapsed)
+    print(f"Wrote {args.report}")
 
 
-def write_report(args, rows, benign_rows, malicious_rows, results_body, run_started_at, wall_elapsed) -> None:
-    corpus_label_counts = f"{len(rows)} rows ({len(benign_rows)} benign, {len(malicious_rows)} malicious)"
+def write_report(args, config, all_rows, scored_rows, index_rows, benign_rows, malicious_rows,
+                 results_body, run_started_at, wall_elapsed) -> None:
+    all_malicious = [r for r in all_rows if r["label"] == "malicious"]
+    corpus_label_counts = (
+        f"{len(all_rows)} rows "
+        f"({sum(1 for r in all_rows if r['label'] == 'benign')} benign, {len(all_malicious)} malicious)"
+    )
+    scored_counts = f"{len(scored_rows)} rows ({len(benign_rows)} benign, {len(malicious_rows)} malicious)"
     attack_class_counts = defaultdict(int)
-    for r in malicious_rows:
+    for r in all_malicious:
         attack_class_counts[r["attack_class"]] += 1
-    seed_count = sum(1 for r in malicious_rows if r["derivation"] == "original")
-    variant_count = sum(1 for r in malicious_rows if r["derivation"].startswith("variant_of"))
+    seed_count = sum(1 for r in all_malicious if r["derivation"] == "original")
+    variant_count = sum(1 for r in all_malicious if r["derivation"].startswith("variant_of"))
 
     report = f"""# Portcullis Scanner -- Evaluation Report
 
+Run fingerprint: `{config.fingerprint}`
 Generated: {run_started_at}
-Corpus: `control/evals/corpus/corpus.jsonl` -- {corpus_label_counts}
-Layer 3 model: `{args.model}`
-Layer 2 embedder: `all-MiniLM-L6-v2` (local, sentence-transformers, 384-dim)
+Corpus: `control/evals/corpus/corpus.jsonl` -- {corpus_label_counts}, sha256 `{config.corpus_sha256[:16]}`
+Scored population: **held-out split only** -- {scored_counts}
+Layer 2 attack index: {len(index_rows)} train-split malicious rows
+Layer 3 model: `{config.model}`
+Layer 2 embedder: `{config.embedder_model}` (local, sentence-transformers, 384-dim)
+Harness version: {config.harness_version}   git: `{config.git_sha}`
+Package versions: {", ".join(f"{k}=={v}" for k, v in sorted(config.packages.items()))}
 Eval wall-clock duration: {wall_elapsed:.1f}s
+
+Machine-readable results for this run: `control/evals/results/{config.fingerprint}/`
+(`manifest.json`, `metrics.json`, `rows.jsonl`).
+
+> **Quoting a number from this report:** cite it together with the run
+> fingerprint above. Numbers from two different fingerprints came from two
+> different configurations and are not comparable -- that is precisely the
+> mistake this harness was restructured to make impossible.
 
 ## Methodology and limitations
 
 **Corpus size and provenance.** {corpus_label_counts}. Full per-sample provenance
 is in `control/evals/corpus/README.md`; summary:
 
-- **Benign ({len(benign_rows)}):** harvested live via `initialize` -> `tools/list`
+- **Benign ({sum(1 for r in all_rows if r['label'] == 'benign')}):** harvested live via `initialize` -> `tools/list`
   against real third-party MCP servers discovered through the public MCP
   registry (`https://registry.modelcontextprotocol.io`). Not synthetic.
 - **Malicious seeds ({seed_count}):** reproduced from published tool-poisoning
@@ -711,57 +910,68 @@ is in `control/evals/corpus/README.md`; summary:
 
 Malicious rows by attack class: { {k: v for k, v in sorted(attack_class_counts.items())} }
 
-**This is not a held-out test set.** Two specific ways that shows up here:
+**There is now a held-out split, and every headline number comes from it.**
+Split spec `{config.split_spec}` (see `control/evals/split.py`). The assignment is
+grouped, not row-wise: malicious rows move as whole **seed families** and benign
+rows as whole **source servers**, stratified so all four attack classes appear on
+both sides. Group ordering is a hash of the group's own identifier, so the split
+was fixed before any number was computed and cannot be re-rolled to flatter a
+result. The `split` field is committed into `corpus.jsonl`, so which side a row
+landed on is auditable in git.
 
-1. *Layer 2* indexes the malicious corpus itself as its "known attack"
-   lookup table. This script reports layer 2 under BOTH of two indexing
-   schemes -- see the side-by-side table and explanation in the Results
-   section below, this is only the short version:
-   - **Leave-one-out**: excludes only the scored sample's own embedding.
-     Its parent seed and sibling mechanical variants remain in the index,
-     so this measures near-duplicate retrieval more than generalization.
-   - **Leave-one-seed-family-out**: excludes the scored sample's entire
-     seed family (parent seed + all {variant_count} of its mechanical
-     variants) from the index, so it can only match a DIFFERENT seed
-     family or attack class. This is the closer proxy for generalization
-     to a genuinely unseen attack, and it scores lower than leave-one-out
-     -- the gap between the two is reported as a finding, not resolved
-     away by picking one number.
-   Benign rows are scored against the full index either way (nothing of
-   theirs to leave out). Even leave-one-seed-family-out is still
-   evaluation against the same {seed_count}-seed pool this corpus was
-   built from -- not against a genuinely independent attack corpus.
-   The **full cascade** is also reported under both layer-2 schemes (see
-   the cascade comparison table in Results) -- its leave-one-out recall
-   inherits the same sibling-retrieval optimism, and its
-   leave-one-seed-family-out recall shows detection shifting almost
-   entirely onto layer 1 and layer 3 once layer 2 can no longer lean on a
-   near-identical sibling.
-2. *Layer 3* is a general-purpose LLM classifier; nothing here confirms
-   whether `{args.model}` was trained on the (public) disclosures the seeds
-   are drawn from. A strong layer-3 score is consistent with either "the
-   classifier reasons well about this attack pattern" or "the classifier
-   has seen this exact public writeup before" -- this script cannot
-   distinguish the two.
+Split composition:
+
+```
+{split.summarize(all_rows)}
+```
+
+**What this fixed.** Layer 2 previously scored malicious rows against an index
+with the row (or its seed family) removed, while scoring benign rows against the
+*full* index. Precision and recall inside a single published pair therefore came
+from two different index configurations, and the F1 over them described neither.
+Now there is one index -- built from train-split malicious rows only -- and one
+scored population, the held-out side, none of which is in that index. The
+leave-one-out / leave-one-seed-family-out comparison is retained below as a
+**recall-only supplementary diagnostic** over all malicious rows, clearly marked
+as not comparable with the headline block.
+
+**Remaining limitations, unchanged by the split:**
+
+1. Even the held-out families come from the same {seed_count}-seed pool this corpus
+   was built from. A held-out family is unseen *by the index*, not drawn from an
+   independent attack corpus by a different author.
+2. Layer 1's rules were authored with the seed set visible (see
+   `layer1_rules.py`'s own docstring: two rule categories were added because they
+   "show up heavily in the actual corpus seeds"). Its held-out recall is
+   therefore still optimistic relative to genuinely novel attacks, even though no
+   held-out row was individually inspected.
+3. *Layer 3* is a general-purpose LLM classifier; nothing here confirms whether
+   `{config.model}` was trained on the (public) disclosures the seeds are drawn
+   from. A strong layer-3 score is consistent with either "the classifier reasons
+   well about this attack pattern" or "the classifier has seen this exact public
+   writeup before" -- this script cannot distinguish the two.
 
 **Thresholds are untouched code defaults**, not tuned against this corpus or
 this run:
-- Layer 1 short-circuit confidence: `{args.layer1_short_circuit}` (cascade.py default)
-- Layer 2 verdict threshold: `{args.layer2_threshold}` (layer2_similarity.py default)
-- Layer 2 cascade short-circuit similarity: `{args.layer2_short_circuit}` (cascade.py default)
+- Layer 1 short-circuit confidence: `{config.layer1_short_circuit}` (cascade.py default)
+- Layer 2 verdict threshold: `{config.layer2_threshold}` (layer2_similarity.py default)
+- Layer 2 cascade short-circuit similarity: `{config.layer2_short_circuit}` (cascade.py default)
 
 No threshold sweep was run and no value was chosen after looking at the
 resulting precision/recall. If a future run changes any of these to chase a
-headline number, that must be stated here explicitly, not silently.
+headline number, that must be stated here explicitly, not silently -- and the
+run fingerprint will change, so the two reports cannot be confused.
 
 **Verdict-scoring convention.** For precision/recall purposes, layer 1's
 `uncertain` verdict and layer 3 / cascade's `layer3_failure` verdict are both
 scored as *not flagged malicious* (i.e. treated like `benign`). Rationale: a
 layer used standalone, with no downstream layer to resolve the ambiguity,
 would let the tool through either way. Each layer's deferral/rejection rate
-is reported as its own line so this convention doesn't obscure it.
+is reported as its own line so this convention doesn't obscure it. Rows whose
+layer-3 call raised a transport/API error are additionally reported as an
+error-excluded figure, because an outage is not a detection outcome.
 
-**Layer 3 cost avoidance.** Layer 3 is called once per corpus row to produce
+**Layer 3 cost avoidance.** Layer 3 is called once per held-out row to produce
 real standalone layer-3 metrics (a genuine Anthropic API call per row, real
 tokens, real latency). The cascade run then *replays* those same per-row
 results for whichever rows fall through to layer 3, instead of issuing a
@@ -770,9 +980,10 @@ double-billing identical work while still exercising the cascade's real
 short-circuit logic and reporting genuine per-row cost/latency for whichever
 layer actually produced the verdict.
 
-**Small-sample warning.** Per the methodology requirement: any attack class
-with fewer than 10 malicious samples has its recall figure marked
-"not statistically meaningful" below -- treat those numbers as anecdotal.
+**Small-sample warning.** Any attack class with fewer than 10 malicious samples
+has its recall figure marked "not statistically meaningful" below -- treat those
+numbers as anecdotal. The held-out split makes this more acute, not less: it is
+a fraction of an already-small malicious set. `n` is printed beside every figure.
 
 ## Results
 
