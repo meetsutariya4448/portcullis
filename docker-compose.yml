@@ -12,6 +12,39 @@ services:
       - "15432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Applied automatically on first initialisation of an empty data
+      # volume, so a fresh `docker compose up` comes back with the
+      # admission schema already in place.
+      - ./control/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portcullis -d portcullis"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # The out-of-band scanning worker. Default profile: without it, the
+  # gateway's admission gate has a queue nothing drains, so every tool
+  # stays unscanned -- withheld from listings and (by default) allowed on
+  # call with a warning. Running it is what turns admission from a gate
+  # into a working control.
+  #
+  # ANTHROPIC_API_KEY is optional: layers 1 and 2 are local and resolve
+  # most rows on their own. Without it, anything reaching layer 3 is
+  # recorded as layer3_failure -- which the gateway denies by default --
+  # rather than being mistaken for benign.
+  control-worker:
+    build: ./control
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORTCULLIS_ADMISSION_DATABASE_URL: postgres://portcullis:portcullis@postgres:5432/portcullis
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      # Stamped onto every verdict, tying it to the eval run that
+      # characterized this scanner configuration
+      # (control/evals/results/<fingerprint>/).
+      PORTCULLIS_SCANNER_FINGERPRINT: "${PORTCULLIS_SCANNER_FINGERPRINT:-}"
+    restart: unless-stopped
 
   redis:
     image: redis:7
