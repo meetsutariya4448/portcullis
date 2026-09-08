@@ -18,10 +18,11 @@ upstream is contacted, and a server that swaps a cleared description for a
 poisoned one is re-assessed rather than grandfathered. See
 [Tool-poisoning admission](#tool-poisoning-admission).
 
-What remains explicitly **not** done is listed under
-[What's not implemented](#whats-not-implemented) — most importantly, the
-`tools/list` filtering half of admission, and production deployment
-tooling.
+Verdicts are enforced at both points that matter: a poisoned tool is
+withheld from `tools/list` so its description never reaches the model, and
+denied at `tools/call` so it never executes. What remains explicitly
+**not** done is listed under
+[What's not implemented](#whats-not-implemented).
 
 ## What's implemented
 
@@ -105,22 +106,18 @@ recollection: [SPEC-NOTES.md](SPEC-NOTES.md).
 
 ## What's not implemented
 
-- **`tools/list` filtering.** Admission enforces at `tools/call`. The
-  listing half — serving a merged, verdict-filtered `tools/list` from the
-  discovery catalog — is designed but not built, and `tools/list` is still
-  unroutable through the gateway (`handleMCP` requires a
-  namespace-qualified `Mcp-Name` on every request, which the spec requires
-  only for `tools/call`/`resources/read`/`prompts/get`). Until that lands,
-  a poisoned description still reaches the client's model even though
-  calling the tool is blocked.
-- **Legacy upstreams are not discovered.** Tool discovery speaks
-  `2026-07-28` directly; reaching a `2025-11-25` upstream needs a
-  handshaken session from `internal/translate`. Legacy upstreams are
-  skipped explicitly rather than silently yielding an empty catalog, but
-  their tools are therefore never scanned.
+- **A full eval run under the current harness.** The harness was rebuilt
+  around a held-out split and per-run fingerprinting, but re-running it
+  needs `ANTHROPIC_API_KEY`. Only the local layers have been measured under
+  it — see [Measured results](#measured-results), where the superseded
+  figures are retracted rather than restated.
 - **Per-principal listings.** The discoverer lists with the gateway's own
   credentials, so a server that varies its tool list by authenticated
   principal (permitted by SPEC-NOTES.md §2) is modelled as a single list.
+  The policy engine still filters the merged listing per client.
+- **Admission for `resources/read` and `prompts/get`.** Both are
+  name-bearing, but a tool-poisoning verdict is about a tool definition;
+  covering them needs verdicts the scanner does not produce.
 - **Production deployment.** `docker-compose.yml` is a local dev stack;
   there's no Kubernetes/Helm config, CI deploy pipeline, or image registry
   publishing.
@@ -207,13 +204,20 @@ filing a verdict under a key the gateway will never read.
 
 **Outcomes** (`admission:` in `gateway/config.example.yaml`):
 
-| Verdict | `tools/call` | Configurable |
-|---|---|---|
-| `benign` | allow | no |
-| `malicious` | **deny** (403, JSON-RPC `-32001`) | no |
-| `uncertain`, `layer3_failure` | deny | `on_uncertain` |
-| no verdict for the current hash | allow + warn | `on_unknown` |
-| verdict store unreachable | last-known verdict, else allow + error log | `on_unavailable` |
+| Verdict | `tools/list` | `tools/call` | Configurable |
+|---|---|---|---|
+| `benign` | listed | allow | no |
+| `malicious` | **withheld** | **deny** (403, JSON-RPC `-32001`) | no |
+| `uncertain`, `layer3_failure` | withheld | deny | `on_uncertain` |
+| no verdict for the current hash | **withheld** | allow + warn | `on_unknown` |
+| verdict store unreachable | withheld | last-known verdict, else allow + error log | `on_unavailable` |
+
+Withholding an unscanned description from listings is what closes the
+obvious bypass: a server that mutates its description on every listing
+keeps the content hash perpetually new, so a verdict never applies to what
+it is currently serving. Calls fail open by default so a fresh deployment
+stays usable before the first scan lands; listings do not, because that is
+where the attack actually lands.
 
 `malicious` and `benign` are deliberately not configurable: an operator who
 wants monitor mode turns the gate off rather than configuring it into
@@ -231,6 +235,13 @@ fingerprint that characterizes how good that judgement is.
  call  | exfiltrate | deny     | malicious    | c14d8cd807d0 | malicious | 6cdd4785936c4da9
  call  | summarize  | allow    | unknown_hash | db413fc7cbe1 |           |
 ```
+
+**Measured cost** — the request path does a cached lookup, never a model
+call. Added p50 is ~0.2ms with a warm cache and ~0.3ms with the cache
+disabled entirely (every request re-reading Postgres); the gate's own
+histogram puts the mean at 0.17ms in that worst case, with 38% of requests
+under 100µs. Full method, caveats and the second run in
+[bench/results.md](bench/results.md#tool-poisoning-admission-overhead).
 
 Metrics: `portcullis_admission_decisions_total{point,outcome,reason,namespace}`,
 `portcullis_admission_latency_seconds{point}` (reported separately from the

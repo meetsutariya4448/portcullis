@@ -131,7 +131,7 @@ running, not a differently-indexed one.
 `gateway/internal/admission`, Go. Three pieces:
 
 - **Discoverer** — on startup and every `refresh_interval`, calls
-  `tools/list` against each native upstream on the gateway's own behalf
+  `tools/list` against each upstream on the gateway's own behalf
   (SPEC-NOTES.md §1 prescribes exactly this: "once per upstream at
   startup/config-load, not per client request"), hashes every
   `(name, description, inputSchema)`, and replaces that namespace's catalog
@@ -146,6 +146,18 @@ running, not a differently-indexed one.
   behind a bounded TTL cache, policy evaluation. No network call, no model
   call. Placed in `handleMCP` after the policy gate and before routing, so a
   denied call costs no routing work and the upstream is never contacted.
+  Measured at ~0.2ms added p50 warm, ~0.3ms with the cache disabled — see
+  [bench/results.md](bench/results.md#tool-poisoning-admission-overhead).
+
+`tools/list` is **served** by the gateway rather than proxied: it carries no
+`Mcp-Name`, so it has no namespace to route to, and no single upstream
+knows the namespaced names clients use. The catalog already holds every
+upstream's tools under `{namespace}.{tool}`, so the merged listing comes
+from there, filtered by both the policy engine and the verdicts. That is
+also the enforcement point that matters most — tool poisoning lands when a
+model reads a description, so withholding beats blocking the later call.
+Legacy `2025-11-25` upstreams are discovered through `translate.Pool`,
+which owns their handshake and session.
 
 Verdicts are keyed by `(namespace, tool_name, content_hash)` and rows are
 never updated in place, so a tool's verdict history falls out of the schema
