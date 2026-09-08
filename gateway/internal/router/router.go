@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -198,4 +199,27 @@ func (r *Router) Resolve(namespace string) ([]*Upstream, error) {
 		return nil, fmt.Errorf("no upstream configured for namespace %q", namespace)
 	}
 	return group, nil
+}
+
+// All returns every configured upstream across all namespaces, ordered by
+// namespace then by position within that namespace's failover group.
+//
+// Added for the admission discoverer, which needs to list each upstream's
+// tools on the gateway's own behalf. It walks every group member rather
+// than only primaries: a failover secondary can serve a tools/call, so its
+// tool definitions need judging too, and a secondary quietly serving a
+// poisoned description while the primary is healthy is exactly the gap
+// that "only scan the primary" would leave open.
+func (r *Router) All() []*Upstream {
+	namespaces := make([]string, 0, len(r.upstreams))
+	for namespace := range r.upstreams {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+
+	out := make([]*Upstream, 0, len(r.upstreams))
+	for _, namespace := range namespaces {
+		out = append(out, r.upstreams[namespace]...)
+	}
+	return out
 }

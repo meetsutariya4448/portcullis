@@ -188,6 +188,101 @@ func (q Quota) WindowDuration() (time.Duration, error) {
 	return d, nil
 }
 
+// Admission defaults. Discovery is what keeps the catalog current; the
+// cache is what keeps admission a map lookup rather than a database round
+// trip on every proxied call.
+const (
+	defaultAdmissionRefreshInterval = 5 * time.Minute
+	defaultAdmissionCacheTTL        = 30 * time.Second
+	defaultAdmissionCacheMaxEntries = 8192
+	defaultAdmissionLookupTimeout   = 250 * time.Millisecond
+)
+
+// Admission configures enforcement of tool-poisoning scanner verdicts.
+// Enabled defaults to false: an absent or disabled `admission:` block means
+// no verdict is ever consulted and every tool is admitted, today's
+// behavior, unchanged, for any config that doesn't opt in.
+//
+// The gateway never scans on the request path. A background discoverer
+// lists each upstream's tools, hashes each definition, and queues unscanned
+// ones; the Python control plane scans out of band and writes verdicts to
+// the same Postgres database. See internal/admission.
+type Admission struct {
+	Enabled bool `yaml:"enabled"`
+	// DatabaseURL is the Postgres connection string holding the verdicts.
+	// Supports a ${SECRET:NAME} reference (see internal/secret).
+	DatabaseURL string `yaml:"database_url"`
+	// RefreshInterval is how often each upstream's tool list is re-fetched
+	// and re-hashed. This is the rug-pull detection latency: a description
+	// swapped right after a refresh goes unnoticed for at most this long.
+	RefreshInterval string `yaml:"refresh_interval"`
+	// CacheTTL bounds how long a verdict is reused without re-reading the
+	// store, and so how long a freshly-written verdict takes to take effect.
+	CacheTTL string `yaml:"cache_ttl"`
+	// CacheMaxEntries bounds the in-process verdict cache. Keys come from
+	// upstreams rather than from config, so this bound is load-bearing.
+	CacheMaxEntries int `yaml:"cache_max_entries"`
+	// LookupTimeout bounds a single verdict read. On expiry the request
+	// takes the OnUnavailable path rather than waiting on a wedged database.
+	LookupTimeout string `yaml:"lookup_timeout"`
+	// OnUncertain is "allow" or "deny" for an `uncertain` or
+	// `layer3_failure` verdict -- the scanner looked and could not
+	// conclude. Defaults to "deny".
+	OnUncertain string `yaml:"on_uncertain"`
+	// OnUnknown is "allow" or "deny" for a tools/call naming a tool whose
+	// current definition has no verdict. Defaults to "allow"; listings
+	// always withhold such a tool regardless, which is what stops an
+	// upstream from evading scanning by mutating its description.
+	OnUnknown string `yaml:"on_unknown"`
+	// OnUnavailable is "allow" or "deny" for a tools/call when the verdict
+	// store cannot be reached and no cached verdict applies. Defaults to
+	// "allow"; every such request is logged at error level and counted.
+	OnUnavailable string `yaml:"on_unavailable"`
+}
+
+// RefreshIntervalDuration parses RefreshInterval, falling back to the
+// default when unset.
+func (a Admission) RefreshIntervalDuration() (time.Duration, error) {
+	return parseDurationOrDefault("admission.refresh_interval", a.RefreshInterval, defaultAdmissionRefreshInterval)
+}
+
+// CacheTTLDuration parses CacheTTL, falling back to the default when unset.
+func (a Admission) CacheTTLDuration() (time.Duration, error) {
+	return parseDurationOrDefault("admission.cache_ttl", a.CacheTTL, defaultAdmissionCacheTTL)
+}
+
+// LookupTimeoutDuration parses LookupTimeout, falling back to the default
+// when unset.
+func (a Admission) LookupTimeoutDuration() (time.Duration, error) {
+	return parseDurationOrDefault("admission.lookup_timeout", a.LookupTimeout, defaultAdmissionLookupTimeout)
+}
+
+// CacheMaxEntriesOrDefault returns CacheMaxEntries, falling back to the
+// default when unset.
+func (a Admission) CacheMaxEntriesOrDefault() int {
+	if a.CacheMaxEntries <= 0 {
+		return defaultAdmissionCacheMaxEntries
+	}
+	return a.CacheMaxEntries
+}
+
+// parseDurationOrDefault parses a YAML duration string, substituting a
+// default when unset. Unlike the older *Duration helpers in this file,
+// which return (0, nil) for unset and leave substitution to the caller,
+// admission's durations all have a single sensible default and no caller
+// needs to distinguish "unset" from "zero" -- so the default is applied
+// here rather than repeated at every call site.
+func parseDurationOrDefault(field, value string, fallback time.Duration) (time.Duration, error) {
+	if value == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", field, value, err)
+	}
+	return d, nil
+}
+
 // defaultTracingServiceName is used for the OTel resource's service.name
 // attribute when Tracing.ServiceName is unset.
 const defaultTracingServiceName = "portcullis"
@@ -286,6 +381,7 @@ type Config struct {
 	RateLimit   RateLimit `yaml:"rate_limit"`
 	Quota       Quota     `yaml:"quota"`
 	Tracing     Tracing   `yaml:"tracing"`
+	Admission   Admission `yaml:"admission"`
 }
 
 // MaxInflightOrDefault returns MaxInflight, falling back to
@@ -382,6 +478,54 @@ func (c *Config) validate() error {
 	}
 	if err := c.Tracing.validate(); err != nil {
 		return err
+	}
+	if err := c.Admission.validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a Admission) validate() error {
+	if a.CacheMaxEntries < 0 {
+		return fmt.Errorf("admission: cache_max_entries must be >= 0, got %d", a.CacheMaxEntries)
+	}
+	for _, d := range []struct {
+		field string
+		parse func() (time.Duration, error)
+	}{
+		{"refresh_interval", a.RefreshIntervalDuration},
+		{"cache_ttl", a.CacheTTLDuration},
+		{"lookup_timeout", a.LookupTimeoutDuration},
+	} {
+		parsed, err := d.parse()
+		if err != nil {
+			return err
+		}
+		if parsed <= 0 {
+			return fmt.Errorf("admission: %s must be > 0, got %s", d.field, parsed)
+		}
+	}
+	// A typo must fail at startup rather than silently falling back to a
+	// default posture the operator did not choose -- this gate is a
+	// security control, and quietly running it in the wrong mode is worse
+	// than refusing to start.
+	// Validated here rather than by importing internal/admission: every
+	// other block in this file validates its own YAML shape and leaves the
+	// conversion to a typed value to main.go's builders (cf. Retry and
+	// CircuitBreaker, converted in internal/router).
+	for _, o := range []struct{ field, value string }{
+		{"admission.on_uncertain", a.OnUncertain},
+		{"admission.on_unknown", a.OnUnknown},
+		{"admission.on_unavailable", a.OnUnavailable},
+	} {
+		switch o.value {
+		case "", "allow", "deny":
+		default:
+			return fmt.Errorf("%s must be \"allow\" or \"deny\", got %q", o.field, o.value)
+		}
+	}
+	if a.Enabled && a.DatabaseURL == "" {
+		return fmt.Errorf("admission: database_url is required when admission is enabled")
 	}
 	return nil
 }

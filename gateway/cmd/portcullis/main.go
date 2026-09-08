@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meetsutariya4448/portcullis/gateway/internal/admission"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/auth"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/config"
 	"github.com/meetsutariya4448/portcullis/gateway/internal/policy"
@@ -58,6 +59,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	admissionGate, admissionCloser, err := buildAdmission(context.Background(), cfg, rtr, log)
+	if err != nil {
+		log.Error("failed to build the tool-poisoning admission gate", "error", err)
+		os.Exit(1)
+	}
+	if admissionCloser != nil {
+		defer admissionCloser()
+	}
+
 	tracerProvider, err := tracing.BuildProvider(context.Background(), cfg.Tracing)
 	if err != nil {
 		log.Error("failed to build tracer provider", "error", err)
@@ -78,6 +88,7 @@ func main() {
 		Policy:        pol,
 		RateLimiter:   limiter,
 		QuotaTracker:  quotaTracker,
+		Admission:     admissionGate,
 	})
 	httpServer := &http.Server{Handler: srv}
 
@@ -89,7 +100,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled, "policy_rules", len(cfg.Policy.Rules), "rate_limit_enabled", cfg.RateLimit.Enabled, "quota_enabled", cfg.Quota.Enabled, "tracing_enabled", cfg.Tracing.Enabled)
+	log.Info("portcullis starting", "addr", listener.Addr().String(), "upstreams", len(cfg.Upstreams), "max_inflight", cfg.MaxInflightOrDefault(), "auth_enabled", cfg.Auth.Enabled, "policy_rules", len(cfg.Policy.Rules), "rate_limit_enabled", cfg.RateLimit.Enabled, "quota_enabled", cfg.Quota.Enabled, "tracing_enabled", cfg.Tracing.Enabled, "admission_enabled", cfg.Admission.Enabled)
 	runErr := run(ctx, stop, httpServer, listener, *shutdownTimeout, log)
 
 	if tracerProvider != nil {
@@ -214,4 +225,97 @@ func run(ctx context.Context, stop context.CancelFunc, httpServer *http.Server, 
 		log.Info("shutdown complete")
 		return nil
 	}
+}
+
+// buildAdmission constructs the tool-poisoning admission gate and starts
+// the background discoverer that keeps its catalog current.
+//
+// Returns (nil, nil, nil) when admission is disabled: the server's
+// admission gate treats a nil Gate as "off," today's behavior, unchanged,
+// for a config with no admission: block.
+//
+// The returned closer stops the discoverer and drains the decision log.
+// Failure to reach the verdict store is fatal here rather than degraded:
+// an operator who switched this on asked for enforcement, and starting up
+// into a permanent fail-open state while reporting success is the one
+// outcome a security control must not have.
+func buildAdmission(ctx context.Context, cfg *config.Config, rtr *router.Router, log *slog.Logger) (*admission.Gate, func(), error) {
+	if !cfg.Admission.Enabled {
+		return nil, nil, nil
+	}
+
+	databaseURL, err := secret.Expand(cfg.Admission.DatabaseURL, secret.EnvProvider{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolving admission.database_url: %w", err)
+	}
+
+	cacheTTL, err := cfg.Admission.CacheTTLDuration()
+	if err != nil {
+		return nil, nil, err
+	}
+	lookupTimeout, err := cfg.Admission.LookupTimeoutDuration()
+	if err != nil {
+		return nil, nil, err
+	}
+	refreshInterval, err := cfg.Admission.RefreshIntervalDuration()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	store, err := admission.NewPostgresStore(ctx, databaseURL, log)
+	if err != nil {
+		return nil, nil, err
+	}
+	sink := admission.NewPostgresDecisionSink(store, log, 0)
+
+	gate := admission.NewGate(admission.GateOptions{
+		Store: store,
+		Log:   log,
+		Sink:  sink,
+		Policy: admission.Policy{
+			OnUncertain:   admission.Outcome(cfg.Admission.OnUncertain),
+			OnUnknown:     admission.Outcome(cfg.Admission.OnUnknown),
+			OnUnavailable: admission.Outcome(cfg.Admission.OnUnavailable),
+		},
+		CacheTTL:      cacheTTL,
+		CacheMaxSize:  cfg.Admission.CacheMaxEntriesOrDefault(),
+		LookupTimeout: lookupTimeout,
+	})
+
+	upstreams := make([]admission.Upstream, 0, len(rtr.All()))
+	for _, u := range rtr.All() {
+		upstreams = append(upstreams, admission.Upstream{
+			Name:            u.Name,
+			Namespace:       u.Namespace,
+			URL:             u.URL,
+			Client:          u.Client,
+			ProtocolVersion: u.ProtocolVersion,
+		})
+	}
+
+	discoverer := admission.NewDiscoverer(upstreams, gate, log, refreshInterval)
+	// Warm the catalog before serving traffic. Otherwise the first requests
+	// after a restart would see an empty catalog and be judged
+	// "undiscovered" -- a decision about the gateway's own startup timing
+	// rather than about the tool.
+	discoverer.RefreshAll(ctx)
+
+	discoverCtx, stopDiscovery := context.WithCancel(context.Background())
+	go discoverer.Run(discoverCtx)
+
+	policy := gate.Policy()
+	log.Info("admission enabled",
+		"upstreams_discovered", len(upstreams),
+		"tools_in_catalog", gate.Catalog().Len(),
+		"refresh_interval", refreshInterval.String(),
+		"cache_ttl", cacheTTL.String(),
+		"on_uncertain", string(policy.OnUncertain),
+		"on_unknown", string(policy.OnUnknown),
+		"on_unavailable", string(policy.OnUnavailable))
+
+	return gate, func() {
+		stopDiscovery()
+		sink.Close()
+		store.Close()
+	}, nil
 }

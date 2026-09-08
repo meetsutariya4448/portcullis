@@ -4,3 +4,33 @@ upstreams:
     url: http://localhost:9001/mcp
     protocol_version: "2026-07-28"
     timeout: 30s
+
+# Tool-poisoning admission (optional; absent or disabled = every tool is
+# admitted, exactly as before this feature existed).
+#
+# The gateway never scans on the request path. A background discoverer lists
+# each upstream's tools, hashes every (name, description, inputSchema), and
+# queues unscanned definitions; the Python control plane scans out of band
+# and writes verdicts to the same database. See control/migrations/001_admission.sql.
+admission:
+  enabled: false
+  database_url: "${SECRET:PORTCULLIS_ADMISSION_DATABASE_URL}"
+  # How often each upstream's tool list is re-fetched and re-hashed. This is
+  # the rug-pull detection latency: a description swapped just after a
+  # refresh goes unnoticed for at most this long.
+  refresh_interval: 5m
+  # How long a verdict is reused without re-reading the store, and so how
+  # long a freshly-written verdict takes to take effect.
+  cache_ttl: 30s
+  cache_max_entries: 8192
+  lookup_timeout: 250ms
+  # "uncertain" and "layer3_failure" -- the scanner looked and could not
+  # conclude.
+  on_uncertain: deny
+  # A tools/call naming a tool whose CURRENT definition has no verdict.
+  # Listings withhold such a tool regardless of this setting, which is what
+  # stops an upstream evading scanning by mutating its description.
+  on_unknown: allow
+  # A tools/call when the verdict store is unreachable and no cached verdict
+  # applies. Every such request is logged at error level and counted.
+  on_unavailable: allow
