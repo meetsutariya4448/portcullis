@@ -127,10 +127,30 @@ class Layer3LLM:
                 rejected_reason=f"no_parsed_output(stop_reason={response.stop_reason!r})",
             )
 
-        # HARD REQUIREMENT: evidence_span must be a literal substring of the
-        # input description. Verify programmatically; reject (do not repair)
-        # on failure. Applies whenever evidence_span is non-empty, regardless
-        # of verdict.
+        # HARD REQUIREMENT: a "malicious" verdict must cite a literal
+        # substring of the input description.
+        #
+        # An empty span used to slip through this check entirely, because the
+        # guard only ran when evidence_span was non-empty. That let the one
+        # thing this module exists to prevent straight through: a "malicious"
+        # verdict with nothing to check it against is exactly the
+        # unfalsifiable "trust me" answer the module docstring calls worse
+        # than no verdict. Nothing downstream -- a reviewer, an eval, an
+        # audit log, or the gateway's decision log -- could tell it from a
+        # justified one.
+        if parsed.verdict == "malicious" and not parsed.evidence_span:
+            return Layer3Result(
+                verdict="layer3_failure",
+                attack_class=parsed.attack_class,
+                evidence_span=None,
+                confidence=parsed.confidence,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                rejected_reason="malicious_verdict_without_evidence_span",
+            )
+
+        # Verify programmatically; reject (do not repair) on failure.
+        # Applies whenever evidence_span is non-empty, regardless of verdict.
         if parsed.evidence_span and parsed.evidence_span not in description:
             return Layer3Result(
                 verdict="layer3_failure",

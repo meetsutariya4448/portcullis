@@ -131,3 +131,42 @@ def test_classify_passes_model_and_schema_through_to_the_client():
     assert kwargs["model"] == "claude-opus-5"
     assert kwargs["output_format"] is LLMVerdictSchema
     assert "some description" in kwargs["messages"][0]["content"]
+
+
+def test_malicious_verdict_with_an_empty_evidence_span_is_rejected():
+    """The module's central claim, previously unenforced.
+
+    The substring check only ran when evidence_span was non-empty, so a
+    "malicious" verdict citing nothing at all passed straight through --
+    the exact unfalsifiable answer this layer exists to refuse. Nothing
+    downstream could distinguish it from a justified verdict.
+    """
+    parsed = LLMVerdictSchema(
+        verdict="malicious",
+        attack_class="instruction_injection",
+        evidence_span="",
+        confidence=0.99,
+    )
+    client = FakeClient(_make_response(parsed=parsed))
+    result = Layer3LLM(client=client).classify(
+        "summarize", "A completely ordinary tool description.", {"type": "object"}
+    )
+
+    assert result.verdict == "layer3_failure"
+    assert result.rejected_reason == "malicious_verdict_without_evidence_span"
+    assert result.evidence_span is None
+
+
+def test_benign_verdict_with_an_empty_evidence_span_is_still_accepted():
+    """The mirror case must not regress: benign is REQUIRED to cite nothing,
+    so the new guard has to apply only to malicious verdicts."""
+    parsed = LLMVerdictSchema(
+        verdict="benign", attack_class="none", evidence_span="", confidence=0.9
+    )
+    client = FakeClient(_make_response(parsed=parsed))
+    result = Layer3LLM(client=client).classify(
+        "summarize", "A completely ordinary tool description.", {"type": "object"}
+    )
+
+    assert result.verdict == "benign"
+    assert result.rejected_reason is None

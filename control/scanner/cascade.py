@@ -1,10 +1,14 @@
 """cascade.py — orchestrates layer1 -> layer2 -> layer3 in order.
 
-Short-circuits on a high-confidence result from an earlier (cheaper) layer
-— in either direction: a confidently-clean layer1 pass is just as much a
-short-circuit as a confidently-malicious one, since the whole point is to
-avoid paying for embedding + LLM calls on the common case. Falls through to
-the next layer whenever the current one isn't confident enough.
+Short-circuits on a high-confidence result from an earlier (cheaper) layer.
+Only a confident MALICIOUS layer-1 verdict short-circuits on its own: "zero
+rules matched" is absence of evidence, not evidence of absence, so a clean
+layer-1 pass still gets layer 2's second (free, local) opinion before the
+cascade will call anything safe. Falls through to the next layer whenever
+the current one isn't confident enough.
+
+(This docstring previously claimed the short-circuit worked "in either
+direction", which the code below and its own inline comment contradict.)
 
 Records which layer actually produced the final verdict, and layer 3's
 token cost when it ran, so a caller can audit both cost and provenance per
