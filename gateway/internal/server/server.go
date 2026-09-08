@@ -45,6 +45,17 @@ const maxBodyBytes = 10 << 20 // 10MiB
 // the scanner does not produce.
 const toolCallMethod = "tools/call"
 
+// toolsListMethod is served by Portcullis itself rather than proxied.
+//
+// It carries no Mcp-Name (the spec requires that header only for
+// tools/call, resources/read and prompts/get), so it has no namespace to
+// route by and used to be rejected outright as unroutable. It is also the
+// one response that actually carries tool descriptions -- which is both
+// what makes it answerable from the discovery catalog and what makes
+// filtering it the point: a poisoned description does its damage when the
+// model reads it, not when the tool is called.
+const toolsListMethod = "tools/list"
+
 // toolPoisoningDeniedCode is the JSON-RPC error code for a call blocked by
 // a scanner verdict. In the implementation-defined server-error range
 // (-32000 to -32099) and distinct from the generic -32000 used for other
@@ -56,6 +67,15 @@ const toolPoisoningDeniedCode = -32001
 // isn't configured -- which includes every malformed or probing name, and
 // is what keeps those from each becoming their own time series.
 const unroutedNamespaceLabel = "unrouted"
+
+// toolsListNamespaceLabel labels a tools/list request in the request
+// metrics. It spans every namespace by construction, so no single one
+// describes it.
+const toolsListNamespaceLabel = "_all"
+
+// portcullisVersion identifies the gateway in the serverInfo it returns on
+// results it produces itself, rather than relays.
+const portcullisVersion = "0.1.0"
 
 // apiKeyHeader carries the gateway-edge API key. Deliberately not
 // "Authorization": that header (if a client sends one) is meant for the
@@ -277,6 +297,14 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if err := gwmcp.ValidateHeaders(headers, &req); err != nil {
 		resp := gwmcp.NewHeaderMismatchResponse(req.ID, err)
 		s.writeJSONRPCError(w, r, req.Method, headers.Name, http.StatusBadRequest, resp, handlerStart)
+		return
+	}
+
+	// tools/list is answered from the discovery catalog, before the routing
+	// gate below, because it has no single namespace to route to: the
+	// gateway merges every upstream's tools into one namespaced listing.
+	if req.Method == toolsListMethod && s.admission != nil {
+		s.handleToolsList(w, r, clientID, req, handlerStart)
 		return
 	}
 
