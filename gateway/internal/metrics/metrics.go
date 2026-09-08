@@ -4,20 +4,31 @@ package metrics
 import "github.com/prometheus/client_golang/prometheus"
 
 var (
-	// RequestsTotal counts proxied requests by method, tool, and outcome status.
+	// RequestsTotal counts proxied requests by method, namespace, and
+	// outcome status.
+	//
+	// Labeled by namespace, not by tool. Tool names are client-supplied and
+	// unbounded -- the header only has to agree with the body -- so a `tool`
+	// label let any authenticated caller mint unlimited time series and
+	// exhaust the gateway's memory by varying the name. Namespaces come from
+	// config and are bounded; an unroutable request is labeled "unrouted".
+	// Same reasoning PolicyDeniedTotal already carried.
 	RequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "portcullis_requests_total",
-		Help: "Total MCP requests proxied by Portcullis.",
-	}, []string{"method", "tool", "status"})
+		Help: "Total MCP requests proxied by Portcullis, by method, namespace and status.",
+	}, []string{"method", "namespace", "status"})
 
 	// GatewayLatency measures Portcullis's own per-request overhead —
 	// header validation, routing, and marshaling — excluding time spent
 	// waiting on the upstream round trip.
+	//
+	// Labeled by namespace rather than tool, for the cardinality reason
+	// documented on RequestsTotal above.
 	GatewayLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "portcullis_gateway_latency_seconds",
 		Help:    "Gateway-only overhead per request, excluding upstream round-trip time.",
 		Buckets: prometheus.DefBuckets,
-	}, []string{"method", "tool", "status"})
+	}, []string{"method", "namespace", "status"})
 
 	// CircuitBreakerState is the per-upstream breaker state
 	// (0=closed, 1=open, 2=half_open — translate.BreakerState's values),

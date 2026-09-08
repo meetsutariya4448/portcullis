@@ -52,6 +52,11 @@ const toolCallMethod = "tools/call"
 // "the gateway had a problem" without string-matching the message.
 const toolPoisoningDeniedCode = -32001
 
+// unroutedNamespaceLabel is the metric label for a request whose namespace
+// isn't configured -- which includes every malformed or probing name, and
+// is what keeps those from each becoming their own time series.
+const unroutedNamespaceLabel = "unrouted"
+
 // apiKeyHeader carries the gateway-edge API key. Deliberately not
 // "Authorization": that header (if a client sends one) is meant for the
 // upstream MCP server and is forwarded through unchanged by copyHeaders —
@@ -365,8 +370,8 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 
 	gatewayOverhead := preUpstream + postUpstream
 	status := strconv.Itoa(resp.StatusCode)
-	metrics.RequestsTotal.WithLabelValues(req.Method, headers.Name, status).Inc()
-	metrics.GatewayLatency.WithLabelValues(req.Method, headers.Name, status).Observe(gatewayOverhead.Seconds())
+	metrics.RequestsTotal.WithLabelValues(req.Method, namespace, status).Inc()
+	metrics.GatewayLatency.WithLabelValues(req.Method, namespace, status).Observe(gatewayOverhead.Seconds())
 	metrics.UpstreamLatency.WithLabelValues(upstream.Name, status).Observe(upstreamDuration.Seconds())
 	span.SetAttributes(semconv.HTTPResponseStatusCode(resp.StatusCode))
 
@@ -517,6 +522,27 @@ func (s *Server) forwardNative(ctx context.Context, upstream *router.Upstream, b
 	return resp, nil
 }
 
+// metricNamespace maps a client-supplied tool name to a bounded metric
+// label.
+//
+// Tool names arrive from the client and only have to agree with the request
+// body, so using one as a Prometheus label value let any authenticated
+// caller mint unlimited time series -- 8 requests with random names created
+// 8 counters and 8 histograms, and nothing capped that. The namespace half
+// is only unbounded until it is checked against the router: a configured
+// namespace is one of a fixed set, and anything else collapses to
+// "unrouted".
+func (s *Server) metricNamespace(tool string) string {
+	namespace, _, ok := router.SplitName(tool)
+	if !ok {
+		return unroutedNamespaceLabel
+	}
+	if _, err := s.router.Resolve(namespace); err != nil {
+		return unroutedNamespaceLabel
+	}
+	return namespace
+}
+
 // writeJSONRPCError writes a fully-formed JSON-RPC error response (e.g. a
 // HeaderMismatch) and records logging/metrics for it.
 func (s *Server) writeJSONRPCError(w http.ResponseWriter, r *http.Request, method, tool string, httpStatus int, resp gwmcp.ErrorResponse, handlerStart time.Time) {
@@ -530,8 +556,8 @@ func (s *Server) writeJSONRPCError(w http.ResponseWriter, r *http.Request, metho
 
 	duration := time.Since(handlerStart)
 	status := strconv.Itoa(httpStatus)
-	metrics.RequestsTotal.WithLabelValues(method, tool, status).Inc()
-	metrics.GatewayLatency.WithLabelValues(method, tool, status).Observe(duration.Seconds())
+	metrics.RequestsTotal.WithLabelValues(method, s.metricNamespace(tool), status).Inc()
+	metrics.GatewayLatency.WithLabelValues(method, s.metricNamespace(tool), status).Observe(duration.Seconds())
 	logArgs := append([]any{
 		"method", method,
 		"tool", tool,
@@ -582,8 +608,8 @@ func (s *Server) writeToolPoisoningDenial(w http.ResponseWriter, r *http.Request
 
 	duration := time.Since(handlerStart)
 	status := strconv.Itoa(http.StatusForbidden)
-	metrics.RequestsTotal.WithLabelValues(method, tool, status).Inc()
-	metrics.GatewayLatency.WithLabelValues(method, tool, status).Observe(duration.Seconds())
+	metrics.RequestsTotal.WithLabelValues(method, s.metricNamespace(tool), status).Inc()
+	metrics.GatewayLatency.WithLabelValues(method, s.metricNamespace(tool), status).Observe(duration.Seconds())
 	// The decision itself is logged by the admission gate, with the full
 	// verdict provenance; this line records the HTTP outcome.
 	s.log.Warn("mcp request denied by tool-poisoning admission",
@@ -619,8 +645,8 @@ func (s *Server) writeGatewayError(w http.ResponseWriter, r *http.Request, metho
 
 	duration := time.Since(handlerStart)
 	status := strconv.Itoa(httpStatus)
-	metrics.RequestsTotal.WithLabelValues(method, tool, status).Inc()
-	metrics.GatewayLatency.WithLabelValues(method, tool, status).Observe(duration.Seconds())
+	metrics.RequestsTotal.WithLabelValues(method, s.metricNamespace(tool), status).Inc()
+	metrics.GatewayLatency.WithLabelValues(method, s.metricNamespace(tool), status).Observe(duration.Seconds())
 	logArgs := append([]any{
 		"method", method,
 		"tool", tool,
@@ -654,16 +680,44 @@ func translateForwardError(err error) (httpStatus int, message string) {
 	}
 }
 
-// copyHeaders copies all headers from src to dst except hop-by-hop headers.
+// copyHeaders copies all headers from src to dst except hop-by-hop headers
+// and, when forwarding a request upstream, Portcullis's own edge
+// credential. It does not mutate src.
+//
+// The earlier version deleted hop-by-hop headers from src in place, which
+// mutated the caller's inbound *http.Request headers -- observable to
+// everything later in the pipeline, and to every retry and failover
+// attempt reusing the same map.
 func copyHeaders(dst, src http.Header) {
-	for _, h := range hopByHopHeaders {
-		src.Del(h)
-	}
 	for k, vv := range src {
+		if skipForwardHeader(k) {
+			continue
+		}
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// skipForwardHeader reports whether a header must not be relayed.
+//
+// Hop-by-hop headers describe this specific connection, not the message
+// (RFC 9110). apiKeyHeader is Portcullis's own edge credential: forwarding
+// it handed every upstream in the fleet a key it could replay against the
+// gateway to impersonate that client -- including the untrusted
+// third-party servers this gateway exists to sit in front of. Authorization
+// is deliberately NOT in this set: that header is meant for the upstream
+// and is why Portcullis uses a header of its own (see apiKeyHeader).
+func skipForwardHeader(name string) bool {
+	if strings.EqualFold(name, apiKeyHeader) {
+		return true
+	}
+	for _, h := range hopByHopHeaders {
+		if strings.EqualFold(name, h) {
+			return true
+		}
+	}
+	return false
 }
 
 // isEventStream reports whether contentType (an upstream response's
