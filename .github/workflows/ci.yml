@@ -1,0 +1,37 @@
+name: Gateway CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: portcullis
+          POSTGRES_PASSWORD: portcullis
+          POSTGRES_DB: portcullis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U portcullis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PORTCULLIS_TEST_DATABASE_URL: postgres://portcullis:portcullis@localhost:5432/portcullis
+      PGPASSWORD: portcullis
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+          cache-dependency-path: gateway/go.sum
+      - name: Apply admission schema
+        run: psql -h localhost -U portcullis -d portcullis -v ON_ERROR_STOP=1 -f control/migrations/001_admission.sql
+      - name: Gateway tests including real PostgreSQL
+        working-directory: gateway
+        run: go test ./...
